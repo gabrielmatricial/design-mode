@@ -533,6 +533,18 @@
       drag.targetXs.push(r.left, r.left + r.width / 2, r.right);
       drag.targetYs.push(r.top, r.top + r.height / 2, r.bottom);
     }
+    // Centro do elemento PAI do arrastado: permite centralizar o objeto DENTRO do pai
+    // (eixo horizontal E vertical). O pai é ancestral, então o loop acima o pula
+    // (x.contains(el)); por isso o centro dele só vira alvo de snap aqui, explicitamente.
+    const anchorEl = drag.anchorEl;
+    const parent = anchorEl && anchorEl.parentElement;
+    if (parent && parent !== document.documentElement) {
+      const pr = parent.getBoundingClientRect();
+      if (pr.width >= 8 && pr.height >= 8) {
+        drag.targetXs.push(pr.left + pr.width / 2);
+        drag.targetYs.push(pr.top + pr.height / 2);
+      }
+    }
   }
   function nearestSnap(lines, targets) {
     let best = null;
@@ -587,6 +599,7 @@
     drag.sx = e.clientX;
     drag.sy = e.clientY;
     drag.anchorRect0 = el.getBoundingClientRect(); // p/ o snap medir o elemento agarrado
+    drag.anchorEl = el; // p/ o snap oferecer o centro do elemento PAI como alvo
     buildSnapTargets(new Set(els));
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
