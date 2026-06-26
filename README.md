@@ -58,11 +58,19 @@ keyed by a stable-enough selector (`#id` when present, otherwise a
 window.DesignMode.enable();   // turn design mode on
 window.DesignMode.disable();  // turn it off
 window.DesignMode.toggle();   // flip
+window.DesignMode.quit();     // remove the tool entirely (bar + styles + listeners)
 window.DesignMode.isOn();     // -> boolean
 ```
 
 The toolbar is injected on first load regardless; `enable/disable/toggle` just
-flip the active state (same as clicking the toggle button).
+flip the active state (same as clicking the toggle button). `quit` (the **✕ sair**
+button) tears the tool out completely and leaves the page as you edited it — run
+the bookmarklet again to bring it back.
+
+**While ON the page is inert:** clicks, links, buttons and form submits do not
+respond (you're editing the layout, not using the page). The toolbar itself still
+works, and select/drag/resize behave as usual. Turn OFF (or quit) to restore the
+page's normal click behaviour.
 
 ## Copy / paste behaviour
 

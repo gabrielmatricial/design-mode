@@ -7,9 +7,12 @@
  * Features: floating toolbar, click/Shift+click (multi)select, drag to move
  * (transform translate), native corner resize (↘), align (⬅⬌➡/⬆⬍⬇),
  * undo (Ctrl+Z), copy/paste elements (Ctrl+C / Ctrl+V), delete (Del),
- * export CSS ("copiar layout").
+ * export CSS ("copiar layout"), quit (✕ — removes the tool from the page).
  *
- * Public API: window.DesignMode.enable() / .disable() / .toggle()
+ * While ON the page is INERT: clicks/links/buttons/forms do not respond
+ * (you're editing layout, not using the page). Turn OFF to restore.
+ *
+ * Public API: window.DesignMode.enable() / .disable() / .toggle() / .quit()
  *
  * MIT License.
  */
@@ -68,6 +71,8 @@
     '<button id="dm-undo" title="desfazer (Ctrl+Z)" disabled>↶ undo</button>' +
     '<button id="dm-copy" title="copiar CSS do layout">📋 copiar layout</button>' +
     '<button id="dm-reset" title="desfazer tudo">↺ reset</button>' +
+    '<span class="dm-sep"></span>' +
+    '<button id="dm-quit" title="sair — remove a ferramenta da página">✕ sair</button>' +
     '<span class="dm-cur" id="dm-cur">—</span>';
 
   function ready(fn) {
@@ -89,6 +94,7 @@
       bar.querySelector("#dm-copyel").addEventListener("click", copyElements);
       bar.querySelector("#dm-paste").addEventListener("click", pasteElements);
       bar.querySelector("#dm-del").addEventListener("click", deleteElements);
+      bar.querySelector("#dm-quit").addEventListener("click", quit);
       bar.querySelectorAll("#dm-align button").forEach((b) =>
         b.addEventListener("click", () => align(b.getAttribute("data-al"))));
     });
@@ -108,14 +114,39 @@
     if (on) {
       document.addEventListener("pointerdown", onDown, true);
       document.addEventListener("keydown", onKey, true);
+      CLICK_BLOCK_EVENTS.forEach((t) => document.addEventListener(t, onClickBlock, true));
     } else {
       document.removeEventListener("pointerdown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
+      CLICK_BLOCK_EVENTS.forEach((t) => document.removeEventListener(t, onClickBlock, true));
       clearSel();
     }
   }
 
   function toggle() { setOn(!on); }
+
+  // Com design ON a página fica INERTE: engole cliques/links/botões/forms (você
+  // está editando o layout, não usando a página). A própria barra é exceção. Os
+  // selecionar/arrastar (pointerdown) e o resize nativo (↘) seguem funcionando.
+  const CLICK_BLOCK_EVENTS = ["click", "dblclick", "auxclick", "submit"];
+  function onClickBlock(e) {
+    if (!on || inBar(e.target)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+
+  // QUIT: remove a ferramenta de vez (barra + estilos + listeners + artefatos),
+  // deixando a página como o usuário a editou. Permite reinstalar depois (ex.:
+  // clicar o bookmarklet de novo) zerando o guard __installed.
+  function quit() {
+    setOn(false); // remove listeners + dm-on + limpa seleção (se estava ON)
+    document.querySelectorAll(".dm-editable, .dm-sel")
+      .forEach((n) => n.classList.remove("dm-editable", "dm-sel"));
+    if (bar.parentNode) bar.parentNode.removeChild(bar);
+    if (style.parentNode) style.parentNode.removeChild(style);
+    booted = false;
+    try { delete window.DesignMode; } catch (_) { window.DesignMode = undefined; }
+  }
 
   function onKey(e) {
     if (!on) return;
@@ -485,6 +516,7 @@
     enable() { setOn(true); },
     disable() { setOn(false); },
     toggle() { toggle(); },
+    quit() { quit(); },
     isOn() { return on; },
   };
   window.DesignMode = API;
