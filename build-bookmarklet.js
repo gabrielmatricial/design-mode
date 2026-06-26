@@ -1,0 +1,47 @@
+/*
+ * build-bookmarklet.js — gera bookmarklet.html (link arrastável pros favoritos)
+ * a partir do design-mode.js. Self-contained: inlina o script inteiro, então
+ * funciona em QUALQUER página sem precisar hospedar nada (o repo é privado).
+ * Rode de novo sempre que mudar o design-mode.js:  node build-bookmarklet.js
+ */
+const fs = require("fs");
+const path = require("path");
+
+const src = fs.readFileSync(path.join(__dirname, "design-mode.js"), "utf8");
+
+// 1º clique: injeta o script e liga. Cliques seguintes: alterna (já está carregado).
+const wrapper =
+  "(function(){if(window.DesignMode){window.DesignMode.toggle();return;}" +
+  src +
+  "if(window.DesignMode){window.DesignMode.enable();}})();";
+
+// encodeURIComponent deixa o href seguro pra atributo (sem aspas/&/</>), e o
+// navegador decodifica antes de executar o javascript: — método padrão de bookmarklet.
+const href = "javascript:" + encodeURIComponent(wrapper);
+
+const html = `<!doctype html>
+<meta charset="utf-8">
+<title>Design Mode — bookmarklet</title>
+<style>
+  body{font:15px/1.6 system-ui,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;background:#0b0d10;color:#dde}
+  a.bm{display:inline-block;font:14px ui-monospace,monospace;padding:10px 16px;background:#13241b;color:#9f7;border:1px solid #1dc077;border-radius:8px;text-decoration:none;cursor:grab}
+  code{background:#1b222c;padding:2px 6px;border-radius:4px;color:#cfe}
+  kbd{background:#1b222c;border:1px solid #38414e;border-radius:4px;padding:1px 6px;font:12px ui-monospace,monospace}
+  .muted{color:#8aa}
+</style>
+<h1>🎨 Design Mode</h1>
+<p><b>Arraste o botão abaixo pra sua barra de favoritos</b> (mostre-a com <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>):</p>
+<p><a class="bm" href="${href}">🎨 Design Mode</a></p>
+<p>Depois, em <b>qualquer página</b>, clique no favorito: a barra aparece no canto inferior-direito. Clicar de novo liga/desliga.</p>
+<h3>Atalhos</h3>
+<ul>
+  <li>Clique = selecionar · <kbd>Shift</kbd>+clique = multi-seleção · <kbd>Esc</kbd> = limpar</li>
+  <li>Arrastar = mover · canto <code>↘</code> = redimensionar</li>
+  <li><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> = copiar / colar · <kbd>Del</kbd> = apagar</li>
+  <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> = desfazer · botão <b>copiar layout</b> = exporta o CSS</li>
+</ul>
+<p class="muted">Não dá pra digitar bookmarklet na barra de endereço (é grande demais) — tem que <b>arrastar</b> o botão. Em qualquer projeto seu, é só usar este mesmo favorito.</p>
+`;
+
+fs.writeFileSync(path.join(__dirname, "bookmarklet.html"), html);
+console.log("bookmarklet.html gerado · href =", href.length, "chars");
