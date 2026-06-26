@@ -63,6 +63,7 @@
   bar.className = "dm-bar";
   bar.innerHTML =
     '<button id="dm-toggle">✎ design: OFF</button>' +
+    '<button id="dm-static" title="modo estático — congela a página: não responde a cliques, dropdowns nem filtros">▣ estático: OFF</button>' +
     '<button id="dm-parent" title="selecionar elemento pai">⬆ pai</button>' +
     '<span class="dm-grp" id="dm-align" title="alinhar (2+ selecionados)">' +
       '<button data-al="left" title="alinhar à esquerda">⬅</button>' +
@@ -111,6 +112,7 @@
       bar.querySelector("#dm-copyel").addEventListener("click", copyElements);
       bar.querySelector("#dm-paste").addEventListener("click", pasteElements);
       bar.querySelector("#dm-del").addEventListener("click", deleteElements);
+      bar.querySelector("#dm-static").addEventListener("click", toggleStatic);
       bar.querySelector("#dm-quit").addEventListener("click", quit);
       bar.querySelector("#dm-front").addEventListener("click", () => layer("front"));
       bar.querySelector("#dm-up").addEventListener("click", () => layer("up"));
@@ -137,32 +139,60 @@
     if (on) {
       document.addEventListener("pointerdown", onDown, true);
       document.addEventListener("keydown", onKey, true);
-      CLICK_BLOCK_EVENTS.forEach((t) => document.addEventListener(t, onClickBlock, true));
     } else {
       document.removeEventListener("pointerdown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
-      CLICK_BLOCK_EVENTS.forEach((t) => document.removeEventListener(t, onClickBlock, true));
       clearSel();
     }
   }
 
   function toggle() { setOn(!on); }
 
-  // Com design ON a página fica INERTE: engole cliques/links/botões/forms (você
-  // está editando o layout, não usando a página). A própria barra é exceção. Os
-  // selecionar/arrastar (pointerdown) e o resize nativo (↘) seguem funcionando.
-  const CLICK_BLOCK_EVENTS = ["click", "dblclick", "auxclick", "submit"];
-  function onClickBlock(e) {
-    if (!on || inBar(e.target)) return;
+  // ── MODO ESTÁTICO ──────────────────────────────────────────────────────────
+  // Toggle DEDICADO (independente do design ON/OFF): congela a página — não
+  // responde a cliques, links, botões, dropdowns nem filtros. A barra é exceção.
+  // Bloqueia em CAPTURA: a família click/change/submit sempre; e `mousedown` só em
+  // controles interativos (assim o `<select>`, que abre no mousedown, não abre, e o
+  // foco não vai pro campo) — `pointerdown` fica LIVRE pro design selecionar/arrastar
+  // e o resize nativo (↘) em elementos de layout segue funcionando.
+  let staticOn = false;
+  const STATIC_BLOCK_EVENTS = ["click", "dblclick", "auxclick", "contextmenu", "submit", "change", "input", "beforeinput"];
+  const STATIC_CTRL_SEL =
+    'a,button,select,input,textarea,label,summary,details,option,[onclick],' +
+    '[role="button"],[role="tab"],[role="option"],[role="menuitem"],[role="combobox"],[contenteditable]';
+  function onStaticBlock(e) {
+    if (inBar(e.target)) return;
+    if (e.type === "mousedown") {
+      const ctrl = e.target && e.target.closest ? e.target.closest(STATIC_CTRL_SEL) : null;
+      if (!ctrl) return; // mousedown em layout puro passa (resize nativo / drag do design)
+    }
     e.preventDefault();
     e.stopImmediatePropagation();
   }
+  function setStatic(next) {
+    boot();
+    const want = !!next;
+    if (want === staticOn) return;
+    staticOn = want;
+    document.body.classList.toggle("dm-static", staticOn);
+    const btn = bar.querySelector("#dm-static");
+    if (btn) {
+      btn.textContent = staticOn ? "▣ estático: ON" : "▣ estático: OFF";
+      btn.classList.toggle("on", staticOn);
+    }
+    const types = STATIC_BLOCK_EVENTS.concat(["mousedown"]);
+    if (staticOn) types.forEach((t) => document.addEventListener(t, onStaticBlock, true));
+    else types.forEach((t) => document.removeEventListener(t, onStaticBlock, true));
+  }
+  function toggleStatic() { setStatic(!staticOn); }
 
   // QUIT: remove a ferramenta de vez (barra + estilos + listeners + artefatos),
   // deixando a página como o usuário a editou. Permite reinstalar depois (ex.:
   // clicar o bookmarklet de novo) zerando o guard __installed.
   function quit() {
     setOn(false); // remove listeners + dm-on + limpa seleção (se estava ON)
+    setStatic(false); // remove o bloqueio de eventos do modo estático
+    document.body.classList.remove("dm-static");
     document.querySelectorAll(".dm-editable, .dm-sel, .dm-grouped")
       .forEach((n) => n.classList.remove("dm-editable", "dm-sel", "dm-grouped"));
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
@@ -690,6 +720,9 @@
     disable() { setOn(false); },
     toggle() { toggle(); },
     quit() { quit(); },
+    setStatic(v) { setStatic(!!v); },
+    toggleStatic() { toggleStatic(); },
+    isStatic() { return staticOn; },
     isOn() { return on; },
   };
   window.DesignMode = API;
