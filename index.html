@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>design-mode — demo</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: 24px 24px 120px; background: #0e1116; color: #e6edf3; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.lead { color: #9aa7b4; margin: 0 0 20px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 16px; }
+    .card {
+      width: 180px; height: 120px; border-radius: 10px; padding: 14px;
+      box-sizing: border-box; color: #08121a; font-weight: 600;
+      display: flex; align-items: flex-end; box-shadow: 0 4px 14px #0006;
+    }
+    #card-a { background: #6fd3a0; }
+    #card-b { background: #7fb6ff; }
+    #card-c { background: #ffd166; }
+    #card-d { background: #f78da7; }
+    #card-e { background: #c3a6ff; }
+    .hint { margin-top: 28px; font-size: 13px; color: #8aa; line-height: 1.6; }
+    .hint code { background:#1b222c; padding:1px 5px; border-radius:4px; color:#cfe; }
+  </style>
+</head>
+<body>
+  <h1>design-mode — demo</h1>
+  <p class="lead">Clique em <strong>✎ design: OFF</strong> (canto inferior direito) pra ligar.</p>
+
+  <div class="grid">
+    <div class="card" id="card-a">card A</div>
+    <div class="card" id="card-b">card B</div>
+    <div class="card" id="card-c">card C</div>
+    <div class="card" id="card-d">card D</div>
+    <div class="card" id="card-e">card E</div>
+  </div>
+
+  <div class="hint">
+    Atalhos: <strong>arrastar</strong> = mover · <strong>canto ↘</strong> = redimensionar ·
+    <strong>Shift+clique</strong> = multi-seleção · <strong>Ctrl+C / Ctrl+V</strong> = copiar/colar ·
+    <strong>Del</strong> = apagar · <strong>Ctrl+Z</strong> = desfazer ·
+    <code>📋 copiar layout</code> = exporta CSS.
+  </div>
+
+  <script src="design-mode.js"></script>
+</body>
+</html>
