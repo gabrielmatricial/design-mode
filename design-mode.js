@@ -82,12 +82,14 @@
       '<button id="dm-ungroup" title="desagrupar (Ctrl+Shift+G)">▢ desagrupar</button>' +
     '</span>' +
     '<span class="dm-sep"></span>' +
-    '<button id="dm-copyel" title="copiar elemento(s) (Ctrl+C)" disabled>⧉ copiar el</button>' +
+    '<button id="dm-copyel" title="copiar HTML do(s) elemento(s) pro clipboard (Ctrl+C)" disabled>⧉ copiar el</button>' +
+    '<button id="dm-copysel" title="copiar o seletor CSS do(s) elemento(s) pro clipboard" disabled>⛓ copiar seletor</button>' +
+    '<button id="dm-copy" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
+    '<span class="dm-sep"></span>' +
     '<button id="dm-paste" title="colar elemento(s) (Ctrl+V)" disabled>⊕ colar</button>' +
     '<button id="dm-del" title="apagar selecionado(s) (Del)" disabled>🗑 apagar</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-undo" title="desfazer (Ctrl+Z)" disabled>↶ undo</button>' +
-    '<button id="dm-copy" title="copiar CSS do layout">📋 copiar layout</button>' +
     '<button id="dm-reset" title="desfazer tudo">↺ reset</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-quit" title="sair — remove a ferramenta da página">✕ sair</button>' +
@@ -107,6 +109,7 @@
       bar.querySelector("#dm-toggle").addEventListener("click", toggle);
       bar.querySelector("#dm-parent").addEventListener("click", selectParent);
       bar.querySelector("#dm-copy").addEventListener("click", copyLayout);
+      bar.querySelector("#dm-copysel").addEventListener("click", copySelector);
       bar.querySelector("#dm-reset").addEventListener("click", resetAll);
       bar.querySelector("#dm-undo").addEventListener("click", undo);
       bar.querySelector("#dm-copyel").addEventListener("click", copyElements);
@@ -272,9 +275,11 @@
     const undoBtn = bar.querySelector("#dm-undo");
     if (undoBtn) undoBtn.disabled = undoStack.length === 0;
     const copyEl = bar.querySelector("#dm-copyel");
+    const copySelEl = bar.querySelector("#dm-copysel");
     const pasteEl = bar.querySelector("#dm-paste");
     const delEl = bar.querySelector("#dm-del");
     if (copyEl) copyEl.disabled = n === 0;
+    if (copySelEl) copySelEl.disabled = n === 0;
     if (delEl) delEl.disabled = n === 0;
     if (pasteEl) pasteEl.disabled = clipboard.length === 0;
     const cur = bar.querySelector("#dm-cur");
@@ -363,7 +368,44 @@
       clipboard.push(clone.outerHTML);
     }
     updateCur();
-    uiNotifySafe(`${clipboard.length} elemento(s) copiado(s). Ctrl+V pra colar.`, "ok");
+    // Além do clipboard interno (Ctrl+V cola na ferramenta), manda o HTML pro
+    // clipboard do SO — pra colar o markup em qualquer editor.
+    writeClipboard(clipboard.join("\n"), `${clipboard.length} elemento(s): HTML no clipboard · Ctrl+V cola aqui.`);
+  }
+
+  // Copia o seletor CSS do(s) selecionado(s) pro clipboard (lista separada por vírgula).
+  function copySelector() {
+    if (!selected.size) { uiNotifySafe("Selecione 1+ elemento(s) pra copiar o seletor.", "warn"); return; }
+    const els = [...selected].sort((a, b) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+    const sel = els.map(selectorOf).join(", ");
+    writeClipboard(sel, `Seletor copiado (${els.length}).`);
+  }
+
+  // Escreve no clipboard do SO de forma robusta. navigator.clipboard só existe em
+  // contexto seguro (https/localhost) e com foco — em página http vinha undefined e
+  // o código só dava console.log (= "não mandou nada pro clipboard"). Fallback via
+  // textarea + execCommand cobre http e falta de permissão.
+  function writeClipboard(text, okMsg) {
+    function fallback() {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0";
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return ok;
+      } catch (e) { return false; }
+    }
+    const ok = () => uiNotifySafe(okMsg, "ok");
+    const fail = () => { console.log("[design-mode] clipboard:\n" + text); uiNotifySafe("Não consegui escrever no clipboard (conteúdo no console).", "err"); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, () => { fallback() ? ok() : fail(); });
+    } else {
+      fallback() ? ok() : fail();
+    }
   }
 
   function stripDmState(node) {
@@ -691,14 +733,7 @@
       blocks.push(`${selectorOf(c.el)} {\n${decls.join("\n")}\n}`);
     }
     const css = "/* design-mode export — colar no styles.css */\n" + blocks.join("\n\n") + "\n";
-    const done = () => uiNotifySafe(`Layout copiado (${blocks.length} bloco(s)).`, "ok");
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(css).then(done, () => { console.log(css); done(); });
-    } else {
-      console.log(css);
-      done();
-    }
-    console.log(css);
+    writeClipboard(css, `Layout copiado (${blocks.length} bloco(s)).`);
   }
 
   function resetAll() {
