@@ -22,6 +22,7 @@ const href = "javascript:" + encodeURIComponent(wrapper);
 const html = `<!doctype html>
 <meta charset="utf-8">
 <title>Design Mode — bookmarklet</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzEzMjQxYiIvPjx0ZXh0IHg9IjE2IiB5PSIyMiIgZm9udC1mYW1pbHk9InVpLW1vbm9zcGFjZSxtb25vc3BhY2UiIGZvbnQtc2l6ZT0iMTQiIGZvbnQtd2VpZ2h0PSI3MDAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiM5ZmY3NjUiPiZsdDsvJmd0OzwvdGV4dD48L3N2Zz4=">
 <style>
   body{font:15px/1.6 system-ui,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;background:#0b0d10;color:#dde}
   a.bm{display:inline-block;font:14px ui-monospace,monospace;padding:10px 16px;background:#13241b;color:#9f7;border:1px solid #1dc077;border-radius:8px;text-decoration:none;cursor:grab}
@@ -31,7 +32,7 @@ const html = `<!doctype html>
 </style>
 <h1>🎨 Design Mode</h1>
 <p><b>Arraste o botão abaixo pra sua barra de favoritos</b> (mostre-a com <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>):</p>
-<p><a class="bm" href="${href}">🎨 Design Mode</a></p>
+<p><a class="bm" href="${href}">&lt;/&gt; Design Mode</a></p>
 <p>Depois, em <b>qualquer página</b>, clique no favorito: a barra aparece no canto inferior-direito. Clicar de novo liga/desliga.</p>
 <h3>Atalhos</h3>
 <ul>
