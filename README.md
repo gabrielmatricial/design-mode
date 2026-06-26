@@ -39,18 +39,33 @@ Try the included demo: open [`index.html`](./index.html) in a browser.
 | Move | **Drag** the selection (moves all selected together) |
 | Resize | Drag the **↘ bottom-right corner** |
 | Align (2+ selected) | **⬅ ⬌ ➡ / ⬆ ⬍ ⬇** buttons |
+| Snap-align while dragging | Automatic — edges/centers magnetically snap to nearby elements (pink guide lines). Hold **Alt** to disable |
+| Layer order | **⤒ topo** / **↑** (or **]**) / **↓** (or **[**) / **⤓ fundo** — z-index front/up/down/back |
+| Group | Select 2+ then **▣ agrupar** (or **Ctrl+G**) — clicking one member then selects the whole group |
+| Ungroup | **▢ desagrupar** (or **Ctrl+Shift+G**) |
 | Copy element(s) | **Ctrl+C** (or **⧉ copiar el**) |
 | Paste element(s) | **Ctrl+V** (or **⊕ colar**) — pastes as a sibling with a +12px offset, already selected |
 | Delete element(s) | **Del** (or **🗑 apagar**) |
-| Undo | **Ctrl+Z** (or **↶ undo**) — covers move/resize/align **and** paste/delete |
+| Undo | **Ctrl+Z** (or **↶ undo**) — covers move/resize/align/layer **and** paste/delete |
 | Reset all | **↺ reset** |
 | Export CSS | **📋 copiar layout** — copies generated CSS to the clipboard |
 | Deselect | **Esc** |
+| Quit | **✕ sair** — removes the tool from the page |
 
 Moves are applied as `transform: translate(...)`; resize uses native CSS
-`resize: both`. The CSS export emits `width` / `height` / `transform` blocks
-keyed by a stable-enough selector (`#id` when present, otherwise a
-`tag.class:nth-of-type(n)` path).
+`resize: both`; layer order sets `z-index` (forcing `position: relative` only
+when the element was `static`). The CSS export emits `width` / `height` /
+`transform` / `z-index` blocks keyed by a stable-enough selector (`#id` when
+present, otherwise a `tag.class:nth-of-type(n)` path).
+
+**Snap-align:** while dragging, the moved element's left/center/right and
+top/center/bottom lines magnetically snap (within 6px) to the matching lines of
+other elements on the page; thin pink guides mark the active snap. Hold **Alt**
+to move freely.
+
+**Grouping** is non-destructive metadata (`data-dm-group`) — it does not
+re-parent the DOM. Selecting any member selects the whole group, so they move /
+copy / delete together. Export and clones never carry the tool's group attribute.
 
 ## API
 
