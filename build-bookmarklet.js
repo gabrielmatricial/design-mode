@@ -9,11 +9,13 @@ const path = require("path");
 
 const src = fs.readFileSync(path.join(__dirname, "design-mode.js"), "utf8");
 
-// 1º clique: injeta o script e liga. Cliques seguintes: alterna (já está carregado).
+// 1º clique: injeta o script — a barra aparece em modo OFF (maybeAutostart faz boot()
+// sem ligar). Cliques seguintes: alterna ON/OFF (já está carregado). Design mode SEMPRE
+// inicia em OFF; o usuário liga pelo toggle da barra (ou re-clicando no favorito).
 const wrapper =
   "(function(){if(window.DesignMode){window.DesignMode.toggle();return;}" +
   src +
-  "if(window.DesignMode){window.DesignMode.enable();}})();";
+  "})();";
 
 // encodeURIComponent deixa o href seguro pra atributo (sem aspas/&/</>), e o
 // navegador decodifica antes de executar o javascript: — método padrão de bookmarklet.
@@ -33,7 +35,7 @@ const html = `<!doctype html>
 <h1>🎨 Design Mode</h1>
 <p><b>Arraste o botão abaixo pra sua barra de favoritos</b> (mostre-a com <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>):</p>
 <p><a class="bm" href="${href}">&lt;/&gt; Design Mode</a></p>
-<p>Depois, em <b>qualquer página</b>, clique no favorito: a barra aparece no canto inferior-direito. Clicar de novo liga/desliga.</p>
+<p>Depois, em <b>qualquer página</b>, clique no favorito: a barra aparece no canto inferior-direito <b>em modo OFF</b> (a página segue normal). Ligue a edição pelo toggle <code>✎ design</code> da barra — ou clicando de novo no favorito.</p>
 <h3>Atalhos</h3>
 <ul>
   <li>Clique = selecionar · <kbd>Shift</kbd>+clique = multi-seleção · <kbd>Esc</kbd> = limpar</li>
