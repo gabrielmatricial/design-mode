@@ -29,7 +29,21 @@
   const SNAP = 6; // px de tolerância do alinhamento magnético no drag (Alt desliga)
   let groupSeq = 0; // contador de ids de grupo (data-dm-group)
   let guideV = null, guideH = null; // linhas-guia do snap (criadas sob demanda)
-  const changes = new Map(); // el -> { w, h, tx, ty, z, el }
+  const changes = new Map(); // el -> { w, h, tx, ty, z, el, snap? }
+  const baselines = new Map(); // el -> { w, h, tx, ty, z } ANTES da 1ª mutação (before do spec)
+  const notes = new Map(); // el -> { types:Set<string>, text:string } (intenção em linguagem natural)
+  const noteBadges = new Map(); // el -> badge overlay 📌 (NUNCA filho do alvo)
+  let notePop = null; // popover de nota aberto (1 por vez)
+  // Intenções tipadas (chips) — vocabulário curto e acionável pro agente programador.
+  const INTENTS = [
+    { id: "spacing.increase", label: "+ respiro" },
+    { id: "color.wrong", label: "cor errada" },
+    { id: "type.small", label: "fonte pequena" },
+    { id: "semantics.dropdown", label: "vira dropdown" },
+    { id: "role.primary", label: "CTA primário" },
+    { id: "responsive.fluid", label: "responsivo" },
+    { id: "radius", label: "arredondar" },
+  ];
   const selected = new Set(); // seleção MÚLTIPLA (Shift+clique adiciona)
   const undoStack = []; // pilha de snapshots p/ desfazer (Ctrl+Z)
   const clipboard = []; // outerHTML dos elementos copiados (Ctrl+C)
@@ -62,6 +76,20 @@
     .dm-guide{position:fixed;z-index:2147483646;background:#ff3b8d;pointer-events:none;margin:0;padding:0}
     .dm-guide.dm-guide-v{top:0;width:1px;height:100vh}
     .dm-guide.dm-guide-h{left:0;height:1px;width:100vw}
+    .dm-bar #dm-note.on{border-color:#e6a23c;background:#2a2113;color:#ffd27f}
+    .dm-note-pop{position:fixed;z-index:2147483647;width:264px;max-width:96vw;box-sizing:border-box;
+      font:12px ui-monospace,monospace;background:#11151b;color:#cfe;border:1px solid #38414e;
+      border-radius:8px;padding:8px;box-shadow:0 6px 20px #000a}
+    .dm-note-pop .dm-chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px}
+    .dm-note-pop .dm-chip{padding:3px 8px;border:1px solid #38414e;border-radius:999px;background:#1b222c;
+      color:#cfe;cursor:pointer;font:11px ui-monospace,monospace}
+    .dm-note-pop .dm-chip:hover{border-color:#5b8}
+    .dm-note-pop .dm-chip.on{border-color:#1dc077;background:#13241b;color:#9f7}
+    .dm-note-pop textarea{width:100%;box-sizing:border-box;min-height:48px;background:#0d1116;color:#cfe;
+      border:1px solid #38414e;border-radius:6px;padding:5px;font:12px ui-monospace,monospace;resize:vertical}
+    .dm-note-pop .dm-note-hint{color:#8aa;margin-top:5px;font-size:11px}
+    .dm-note-badge{position:fixed;z-index:2147483646;font-size:14px;line-height:1;pointer-events:none;
+      transform:translate(-50%,-50%);filter:drop-shadow(0 1px 2px #000)}
   `;
 
   const bar = document.createElement("div");
@@ -91,7 +119,10 @@
     '<span class="dm-sep dm-edit-only"></span>' +
     '<button id="dm-copyel" title="copiar HTML do(s) elemento(s) pro clipboard (Ctrl+C)" disabled>⧉ copiar el</button>' +
     '<button id="dm-copysel" title="copiar o seletor CSS do(s) elemento(s) pro clipboard" disabled>⛓ copiar seletor</button>' +
+    '<button id="dm-note" title="anotar intenção (cor/tipo/espaço/semântica) ancorada ao elemento — vale em inspecionar e editar (tecla N)" disabled>✎ nota</button>' +
     '<button id="dm-copy" class="dm-edit-only" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
+    '<button id="dm-copyspec" title="copiar SPEC (geometria + intenção) em Markdown + JSON pro agente programador">🧾 copiar spec</button>' +
+    '<button id="dm-copynotes" title="copiar só as notas/intenções (Markdown + JSON)">🗒 copiar notas</button>' +
     '<span class="dm-sep dm-edit-only"></span>' +
     '<button id="dm-paste" class="dm-edit-only" title="colar elemento(s) (Ctrl+V)" disabled>⊕ colar</button>' +
     '<button id="dm-del" class="dm-edit-only" title="apagar selecionado(s) (Del)" disabled>🗑 apagar</button>' +
@@ -118,6 +149,9 @@
       bar.querySelector("#dm-parent").addEventListener("click", selectParent);
       bar.querySelector("#dm-copy").addEventListener("click", copyLayout);
       bar.querySelector("#dm-copysel").addEventListener("click", copySelector);
+      bar.querySelector("#dm-note").addEventListener("click", () => { if (selected.size === 1) openNote([...selected][0]); });
+      bar.querySelector("#dm-copyspec").addEventListener("click", copySpec);
+      bar.querySelector("#dm-copynotes").addEventListener("click", copyNotes);
       bar.querySelector("#dm-reset").addEventListener("click", resetAll);
       bar.querySelector("#dm-undo").addEventListener("click", undo);
       bar.querySelector("#dm-copyel").addEventListener("click", copyElements);
@@ -133,6 +167,9 @@
       bar.querySelector("#dm-ungroup").addEventListener("click", ungroupSelected);
       bar.querySelectorAll("#dm-align button").forEach((b) =>
         b.addEventListener("click", () => align(b.getAttribute("data-al"))));
+      // âncoras dos overlays (badges de nota / popover) seguem o scroll e o resize
+      window.addEventListener("scroll", repositionNotes, true);
+      window.addEventListener("resize", repositionNotes, true);
     });
   }
 
@@ -162,6 +199,7 @@
       document.removeEventListener("keydown", onKey, true);
       if (drag) onUp(); // segurança: encerra qualquer drag em curso
       clearSel();
+      clearNotes(); // setMode("off") limpa o Map de notas + overlays
     }
     updateCur();
   }
@@ -185,7 +223,7 @@
     'a,button,select,input,textarea,label,summary,details,option,[onclick],' +
     '[role="button"],[role="tab"],[role="option"],[role="menuitem"],[role="combobox"],[contenteditable]';
   function onStaticBlock(e) {
-    if (inBar(e.target)) return;
+    if (inBar(e.target) || inNotePop(e.target)) return; // barra e popover de nota são exceção
     if (e.type === "mousedown") {
       const ctrl = e.target && e.target.closest ? e.target.closest(STATIC_CTRL_SEL) : null;
       if (!ctrl) return; // mousedown em layout puro passa (resize nativo / drag do design)
@@ -222,6 +260,10 @@
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
     [guideV, guideH].forEach((g) => { if (g && g.parentNode) g.parentNode.removeChild(g); });
     guideV = guideH = null;
+    clearNotes(); // remove badges 📌 + popover; zera o Map de notas
+    baselines.clear();
+    window.removeEventListener("scroll", repositionNotes, true);
+    window.removeEventListener("resize", repositionNotes, true);
     if (bar.parentNode) bar.parentNode.removeChild(bar);
     if (style.parentNode) style.parentNode.removeChild(style);
     booted = false;
@@ -230,10 +272,18 @@
 
   function onKey(e) {
     if (mode === "off") return;
+    // o popover de nota trata as próprias teclas (Enter/Esc/digitação) — não intercepta
+    if (notePop && notePop.pop.contains(e.target)) return;
     const mod = e.ctrlKey || e.metaKey;
     // ── valem nos dois modos (não mutam o layout) ──
     if (e.key === "Escape") { clearSel(); return; }
     if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyElements(); return; }
+    // Nota (intenção): 'N' com exatamente 1 selecionado — vale em select e edit.
+    if (!mod && (e.key === "n" || e.key === "N")) {
+      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (selected.size === 1) { e.preventDefault(); openNote([...selected][0]); }
+      return;
+    }
     // ── daqui pra baixo: só no modo editor ──
     if (mode !== "edit") return;
     if (mod && (e.key === "g" || e.key === "G")) { e.preventDefault(); if (e.shiftKey) ungroupSelected(); else groupSelected(); }
@@ -302,15 +352,24 @@
     const copySelEl = bar.querySelector("#dm-copysel");
     const pasteEl = bar.querySelector("#dm-paste");
     const delEl = bar.querySelector("#dm-del");
+    const noteEl = bar.querySelector("#dm-note");
+    const copyNotesEl = bar.querySelector("#dm-copynotes");
     if (copyEl) copyEl.disabled = n === 0;
     if (copySelEl) copySelEl.disabled = n === 0;
     if (delEl) delEl.disabled = n === 0;
     if (pasteEl) pasteEl.disabled = clipboard.length === 0;
+    if (noteEl) { noteEl.disabled = n !== 1; noteEl.classList.toggle("on", n === 1 && notes.has([...selected][0])); }
+    if (copyNotesEl) copyNotesEl.disabled = notes.size === 0;
     const cur = bar.querySelector("#dm-cur");
     if (!cur) return;
-    if (n === 0) cur.textContent = changes.size ? changes.size + " edit(s)" : "—";
-    else if (n === 1) cur.textContent = selectorOf([...selected][0]) + "  (" + changes.size + " edit)";
-    else cur.textContent = n + " selecionados  (" + changes.size + " edit)";
+    // contador combinado: edições geométricas + notas de intenção
+    const meta = [];
+    if (changes.size) meta.push(changes.size + " edit" + (changes.size > 1 ? "s" : ""));
+    if (notes.size) meta.push(notes.size + " nota" + (notes.size > 1 ? "s" : ""));
+    const metaStr = meta.length ? "  (" + meta.join(" · ") + ")" : "";
+    if (n === 0) cur.textContent = meta.length ? meta.join(" · ") : "—";
+    else if (n === 1) cur.textContent = selectorOf([...selected][0]) + metaStr;
+    else cur.textContent = n + " selecionados" + metaStr;
   }
 
   // ── undo: snapshots ──
@@ -485,6 +544,7 @@
     }));
     for (const el of els) {
       changes.delete(el);
+      if (notes.has(el)) { notes.delete(el); refreshBadge(el); }
       if (el.parentNode) el.parentNode.removeChild(el);
     }
     selected.clear();
@@ -499,6 +559,7 @@
     const els = [...selected];
     if (els.length < 2) { uiNotifySafe("Selecione 2+ elementos (Shift+clique) pra alinhar.", "warn"); return; }
     pushUndo(els);
+    for (const el of els) markBaseline(el); // "before" do spec antes de alinhar
     const items = els.map((el) => ({ el, r: el.getBoundingClientRect() }));
     let target;
     if (kind === "left") target = Math.min(...items.map((o) => o.r.left));
@@ -545,6 +606,7 @@
     const els = [...selected];
     if (!els.length) { uiNotifySafe("Selecione 1+ elemento(s) pra mudar a camada.", "warn"); return; }
     pushUndo(els);
+    for (const el of els) markBaseline(el); // "before" do spec (inclui z)
     const pool = [];
     for (const c of changes.values()) if (c.z != null) pool.push(c.z);
     for (const el of els) pool.push(zOf(el));
@@ -596,8 +658,16 @@
       if (r.width < 8 || r.height < 8) continue;
       if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
       count++;
-      drag.targetXs.push(r.left, r.left + r.width / 2, r.right);
-      drag.targetYs.push(r.top, r.top + r.height / 2, r.bottom);
+      // alvos como OBJETOS {pos, el, edge}: guardam a IDENTIDADE da linha (de quem é,
+      // qual borda) sem materializar selector (caro) — isso só acontece no vencedor, no onUp.
+      drag.targetXs.push(
+        { pos: r.left, el, edge: "left" },
+        { pos: r.left + r.width / 2, el, edge: "centerX" },
+        { pos: r.right, el, edge: "right" });
+      drag.targetYs.push(
+        { pos: r.top, el, edge: "top" },
+        { pos: r.top + r.height / 2, el, edge: "centerY" },
+        { pos: r.bottom, el, edge: "bottom" });
     }
     // Centro do elemento PAI do arrastado: permite centralizar o objeto DENTRO do pai
     // (eixo horizontal E vertical). O pai é ancestral, então o loop acima o pula
@@ -607,16 +677,21 @@
     if (parent && parent !== document.documentElement) {
       const pr = parent.getBoundingClientRect();
       if (pr.width >= 8 && pr.height >= 8) {
-        drag.targetXs.push(pr.left + pr.width / 2);
-        drag.targetYs.push(pr.top + pr.height / 2);
+        drag.targetXs.push({ pos: pr.left + pr.width / 2, el: parent, edge: "centerX", kind: "parent" });
+        drag.targetYs.push({ pos: pr.top + pr.height / 2, el: parent, edge: "centerY", kind: "parent" });
       }
     }
   }
+  // Compara cada borda do arrastado (lines[]) com cada alvo {pos,...}; devolve o vencedor
+  // (objeto-alvo + delta + qual borda do arrastado casou, via myIdx).
   function nearestSnap(lines, targets) {
     let best = null;
-    for (const l of lines) for (const t of targets) {
-      const ad = Math.abs(t - l);
-      if (ad <= SNAP && (!best || ad < best.ad)) best = { delta: t - l, pos: t, ad };
+    for (let li = 0; li < lines.length; li++) {
+      const l = lines[li];
+      for (const t of targets) {
+        const ad = Math.abs(t.pos - l);
+        if (ad <= SNAP && (!best || ad < best.ad)) best = { delta: t.pos - l, pos: t.pos, ad, target: t, myIdx: li };
+      }
     }
     return best;
   }
@@ -635,6 +710,11 @@
 
   function onDown(e) {
     if (inBar(e.target)) return; // não captura cliques na própria barra
+    if (notePop) {
+      if (notePop.pop.contains(e.target)) return; // interagindo com o popover (chips/textarea)
+      closeNote(true); // clicou fora: salva e fecha — não seleciona/arrasta nesse clique
+      return;
+    }
     const el = e.target.closest("*");
     if (!el || el === document.body || el === document.documentElement) return;
 
@@ -651,6 +731,7 @@
     if (inCorner) {
       // deixa o resize NATIVO (resize:both) agir; só capturamos o tamanho no fim
       pushUndo([el]);
+      markBaseline(el); // grava o "before" antes da 1ª mutação
       const finish = () => {
         record(el);
         window.removeEventListener("pointerup", finish, true);
@@ -664,11 +745,14 @@
     e.stopPropagation();
     const els = [...selected];
     pushUndo(els);
+    for (const x of els) markBaseline(x); // "before" do spec, antes de mover
     drag = els.map((x) => { const c = changes.get(x) || {}; return { el: x, btx: c.tx || 0, bty: c.ty || 0 }; });
     drag.sx = e.clientX;
     drag.sy = e.clientY;
     drag.anchorRect0 = el.getBoundingClientRect(); // p/ o snap medir o elemento agarrado
     drag.anchorEl = el; // p/ o snap oferecer o centro do elemento PAI como alvo
+    drag.lastSnapX = null; // vencedor de snap do ÚLTIMO frame (vira constraint no onUp)
+    drag.lastSnapY = null;
     buildSnapTargets(new Set(els));
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
@@ -684,19 +768,61 @@
       const ys = [a.top + dy, a.top + dy + a.height / 2, a.top + dy + a.height];
       const sx = nearestSnap(xs, drag.targetXs);
       const sy = nearestSnap(ys, drag.targetYs);
-      if (sx) { dx += sx.delta; showGuide("v", sx.pos); } else showGuide("v", null);
-      if (sy) { dy += sy.delta; showGuide("h", sy.pos); } else showGuide("h", null);
-    } else { showGuide("v", null); showGuide("h", null); }
+      if (sx) { dx += sx.delta; showGuide("v", sx.pos); drag.lastSnapX = sx; } else { showGuide("v", null); drag.lastSnapX = null; }
+      if (sy) { dy += sy.delta; showGuide("h", sy.pos); drag.lastSnapY = sy; } else { showGuide("h", null); drag.lastSnapY = null; }
+    } else { showGuide("v", null); showGuide("h", null); drag.lastSnapX = null; drag.lastSnapY = null; }
     for (const d of drag) { d.el.style.transform = `translate(${d.btx + dx}px, ${d.bty + dy}px)`; }
+    repositionNotes(); // badges 📌 acompanham os elementos arrastados
   }
 
   function onUp() {
-    if (drag) for (const d of drag) record(d.el);
+    if (drag) {
+      const anchorEl = drag.anchorEl, sx = drag.lastSnapX, sy = drag.lastSnapY;
+      for (const d of drag) record(d.el);
+      // Constraint: grava a REGRA do encaixe (centro do pai / borda do irmão) ALÉM do px,
+      // só pros eixos que casaram no ÚLTIMO frame. Sem snap (ou Alt) → nenhuma regra inventada.
+      if (anchorEl && (sx || sy)) {
+        const c = changes.get(anchorEl);
+        if (c) {
+          const snap = {};
+          if (sx) snap.x = snapAxis(sx, ["left", "centerX", "right"]);
+          if (sy) snap.y = snapAxis(sy, ["top", "centerY", "bottom"]);
+          c.snap = snap;
+        }
+      }
+    }
     drag = null;
     showGuide("v", null);
     showGuide("h", null);
+    repositionNotes();
     window.removeEventListener("pointermove", onMove, true);
     window.removeEventListener("pointerup", onUp, true);
+  }
+
+  // Materializa a identidade do alvo vencedor (selectorOf SÓ aqui — não nos 600 alvos).
+  function snapAxis(s, myEdges) {
+    const t = s.target;
+    return {
+      myEdge: myEdges[s.myIdx],
+      targetSelector: selectorOf(t.el),
+      targetEdge: t.edge,
+      kind: t.kind || "sibling",
+    };
+  }
+  // Traduz a regra de snap numa frase de constraint (dica de layout pro agente).
+  function snapToConstraint(snap) {
+    if (!snap) return null;
+    const parts = [];
+    if (snap.x) parts.push(constraintPhrase(snap.x, "H"));
+    if (snap.y) parts.push(constraintPhrase(snap.y, "V"));
+    return parts.length ? parts.join(" · ") : null;
+  }
+  function constraintPhrase(s, axis) {
+    if (s.kind === "parent" && (s.targetEdge === "centerX" || s.targetEdge === "centerY")) {
+      return `center-${axis} in parent (${s.targetSelector})`;
+    }
+    const name = { left: "left", right: "right", centerX: "center-H", top: "top", bottom: "bottom", centerY: "center-V" };
+    return `${name[s.myEdge] || s.myEdge} aligned to ${s.targetSelector} (${name[s.targetEdge] || s.targetEdge})`;
   }
 
   function record(el) {
@@ -713,30 +839,124 @@
     updateCur();
   }
 
-  // Seletor CSS estável-o-suficiente pra colar no styles.css.
+  // ── MOTOR DE IDENTIDADE ──────────────────────────────────────────────────────
+  // Primitiva compartilhada por TODO export (copiar seletor/layout/spec/notas).
+  // Objetivo: dar pro agente programador um alvo SEM AMBIGUIDADE e estável entre builds.
+
+  // Classe "estável o suficiente" pra ancorar um seletor. Rejeita:
+  //  - hasheadas de CSS-in-JS (emotion `css-…`, styled-components `sc-…`)
+  //  - sufixos hasheados gerados por bundler/CSS-modules (`foo_x1a2b3`, `Btn-3kf9d`)
+  //  - utilitárias do Tailwind (mudam nada da semântica e repetem em mil nós)
+  function isStableClass(c) {
+    if (!c || c.startsWith("dm-")) return false;
+    if (/^css-/.test(c) || /^sc-/.test(c)) return false;
+    if (/[_-][a-z0-9]{5,}$/i.test(c)) return false;
+    if (/^(p|m|px|py|mx|my|w|h|flex|grid|gap|text|bg|border|rounded|absolute|relative)(-|$)/.test(c)) return false;
+    return true;
+  }
+
+  // Um seletor é confiável quando casa com EXATAMENTE o elemento alvo no documento.
+  function uniqueGlobally(sel, el) {
+    if (!sel) return false;
+    try {
+      const m = document.querySelectorAll(sel);
+      return m.length === 1 && m[0] === el;
+    } catch (_) { return false; }
+  }
+
+  // [attr="valor"] com escape de string (CSS.escape é p/ identificador, não p/ valor).
+  function attrSel(tag, attr, val) {
+    return tag + "[" + attr + '="' + String(val).replace(/[\\"]/g, "\\$&") + '"]';
+  }
+
+  // Seletor CSS ranqueado por ESTABILIDADE: tenta hooks fortes em ordem de confiança e
+  // devolve o 1º globalmente único; só cai no caminho por classe semântica (e nth-of-type
+  // como ÚLTIMO recurso) quando não há nenhum hook estável. Sobe só o necessário.
   function selectorOf(el) {
-    if (el.id) return "#" + cssEsc(el.id);
+    if (!el || el.nodeType !== 1 || el === document.body || el === document.documentElement) {
+      return el && el.tagName ? el.tagName.toLowerCase() : "";
+    }
+    const tag = el.tagName.toLowerCase();
+    const cands = [];
+    if (el.id) cands.push("#" + cssEsc(el.id));
+    for (const a of ["data-testid", "data-test", "data-cy", "data-qa", "data-id"]) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) cands.push(attrSel(tag, a, v));
+    }
+    const name = el.getAttribute && el.getAttribute("name");
+    if (name) cands.push(attrSel(tag, "name", name));
+    const aria = el.getAttribute && el.getAttribute("aria-label");
+    if (aria) cands.push(attrSel(tag, "aria-label", aria));
+    if (tag === "a") {
+      const href = el.getAttribute("href");
+      if (href) cands.push(attrSel(tag, "href", href));
+    }
+    for (const c of cands) if (uniqueGlobally(c, el)) return c;
+    return cssPath(el);
+  }
+
+  // Caminho por classe semântica, subindo só até ficar único. nth-of-type só quando o nó
+  // não tem nenhuma classe estável que o distinga dos irmãos de mesma tag.
+  function cssPath(el) {
     const parts = [];
     let node = el;
     while (node && node.nodeType === 1 && node !== document.body) {
+      if (node.id) { parts.unshift("#" + cssEsc(node.id)); break; }
       let part = node.tagName.toLowerCase();
-      const cls = (node.getAttribute("class") || "")
-        .split(/\s+/)
-        .filter((c) => c && !c.startsWith("dm-"))[0];
+      const cls = (node.getAttribute("class") || "").split(/\s+/).filter(isStableClass)[0];
       if (cls) part += "." + cssEsc(cls);
       const parent = node.parentElement;
-      if (parent) {
+      if (parent && !cls) {
         const sib = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
         if (sib.length > 1) part += `:nth-of-type(${sib.indexOf(node) + 1})`;
       }
       parts.unshift(part);
-      if (node.id) {
-        parts[0] = "#" + cssEsc(node.id);
-        break;
-      }
+      const sel = parts.join(" > ");
+      if (uniqueGlobally(sel, el)) return sel;
       node = parent;
     }
     return parts.join(" > ");
+  }
+
+  // Rótulo humano mais próximo (ancestral/irmão-anterior h1-h6|label|[aria-label]|legend).
+  function nearLabel(el) {
+    const SEL = "h1,h2,h3,h4,h5,h6,label,[aria-label],legend";
+    const txtOf = (n) => {
+      const t = (n.getAttribute && n.getAttribute("aria-label")) || n.textContent || "";
+      return t.trim().replace(/\s+/g, " ").slice(0, 40);
+    };
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.body) {
+      for (let sib = node.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        if (sib.matches && sib.matches(SEL)) { const t = txtOf(sib); if (t) return t; }
+        const inner = sib.querySelector && sib.querySelector(SEL);
+        if (inner) { const t = txtOf(inner); if (t) return t; }
+      }
+      if (node.matches && node.matches(SEL)) { const t = txtOf(node); if (t) return t; }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  // Âncora humana redundante (PURA LEITURA → seguro no modo select). Junta seletor +
+  // texto + papel + rótulo vizinho + atributos distintivos: o agente acha o alvo nem que
+  // o seletor envelheça. Nunca lança em elementos sem texto/role/atributos.
+  function anchorOf(el) {
+    const out = { selector: null, tag: null, id: null, text: "", role: null, near: null, attrs: {} };
+    if (!el || el.nodeType !== 1) return out;
+    try {
+      out.tag = el.tagName.toLowerCase();
+      out.id = el.id || null;
+      out.selector = selectorOf(el);
+      out.text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 60);
+      out.role = el.getAttribute("role") || el.getAttribute("aria-label") || null;
+      out.near = nearLabel(el);
+      for (const a of ["data-testid", "name", "href", "alt"]) {
+        const v = el.getAttribute(a);
+        if (v) out.attrs[a] = v;
+      }
+    } catch (_) {}
+    return out;
   }
 
   function cssEsc(s) {
@@ -757,6 +977,8 @@
         if (c.posForced) decls.push(`  position: relative;`);
         decls.push(`  z-index: ${c.z};`);
       }
+      // dica de layout (constraint do snap) — NÃO substitui o px, só explica a intenção.
+      if (c.snap) { const ph = snapToConstraint(c.snap); if (ph) decls.push(`  /* layout hint: ${ph} */`); }
       blocks.push(`${selectorOf(c.el)} {\n${decls.join("\n")}\n}`);
     }
     const css = "/* design-mode export — colar no styles.css */\n" + blocks.join("\n\n") + "\n";
@@ -775,12 +997,231 @@
       c.el.classList.remove("dm-editable", "dm-sel");
     }
     changes.clear();
+    baselines.clear(); // zera os "before" do spec junto com as edições
     document.querySelectorAll("[data-dm-group]").forEach((n) => {
       n.removeAttribute("data-dm-group");
       n.classList.remove("dm-grouped");
     });
     clearSel();
     uiNotifySafe("Layout resetado.", "ok");
+  }
+
+  // ── NOTA + CHIPS DE INTENÇÃO (canal de linguagem natural, vale em SELECT) ──────
+  // Abre o canal mudo de propósito (cor/tipo/espaço/semântica) SEM virar editor: nada é
+  // appendado dentro do alvo (badge e popover vivem em overlays dm-, posicionados por
+  // getBoundingClientRect) → zero reflow, zero mutação do DOM da página. Respeita o select.
+  function inNotePop(node) { return !!(notePop && notePop.pop.contains(node)); }
+
+  function openNote(el) {
+    if (!el || el.nodeType !== 1) return;
+    closeNote(false); // fecha qualquer popover anterior
+    const existing = notes.get(el);
+    const types = new Set(existing ? existing.types : []);
+    const pop = document.createElement("div");
+    pop.className = "dm-note-pop";
+    const chips = document.createElement("div");
+    chips.className = "dm-chips";
+    for (const it of INTENTS) {
+      const b = document.createElement("button");
+      b.className = "dm-chip" + (types.has(it.id) ? " on" : "");
+      b.textContent = it.label;
+      b.setAttribute("data-intent", it.id);
+      b.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        if (types.has(it.id)) { types.delete(it.id); b.classList.remove("on"); }
+        else { types.add(it.id); b.classList.add("on"); }
+      });
+      chips.appendChild(b);
+    }
+    const ta = document.createElement("textarea");
+    ta.value = existing ? existing.text : "";
+    ta.setAttribute("placeholder", "descreva a intenção pro agente…");
+    const hint = document.createElement("div");
+    hint.className = "dm-note-hint";
+    hint.textContent = "Enter salva · Esc cancela · Shift+Enter quebra linha";
+    pop.appendChild(chips); pop.appendChild(ta); pop.appendChild(hint);
+    (document.body || document.documentElement).appendChild(pop);
+    notePop = { pop, el, types, getText: () => ta.value };
+    positionPop(pop, el);
+    ta.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); closeNote(true); }
+      else if (ev.key === "Escape") { ev.preventDefault(); closeNote(false); }
+    });
+    ta.focus();
+  }
+  function closeNote(save) {
+    if (!notePop) return;
+    const { pop, el, types, getText } = notePop;
+    const text = (getText() || "").trim();
+    notePop = null;
+    if (pop.parentNode) pop.parentNode.removeChild(pop);
+    if (save) {
+      if (types.size || text) notes.set(el, { types, text });
+      else notes.delete(el);
+      refreshBadge(el);
+      updateCur();
+    }
+  }
+  function positionPop(pop, el) {
+    const r = el.getBoundingClientRect();
+    const pw = pop.offsetWidth || 264, ph = pop.offsetHeight || 140;
+    let left = r.left, top = r.bottom + 6;
+    if (top + ph > innerHeight) top = Math.max(6, r.top - ph - 6);
+    if (left + pw > innerWidth) left = Math.max(6, innerWidth - pw - 6);
+    pop.style.left = Math.max(6, left) + "px";
+    pop.style.top = Math.max(6, top) + "px";
+  }
+  function refreshBadge(el) {
+    let badge = noteBadges.get(el);
+    if (notes.has(el) && el.isConnected) {
+      if (!badge) {
+        badge = document.createElement("div");
+        badge.className = "dm-note-badge";
+        badge.textContent = "📌";
+        (document.body || document.documentElement).appendChild(badge);
+        noteBadges.set(el, badge);
+      }
+      positionBadge(badge, el);
+    } else if (badge) {
+      if (badge.parentNode) badge.parentNode.removeChild(badge);
+      noteBadges.delete(el);
+    }
+  }
+  function positionBadge(badge, el) {
+    const r = el.getBoundingClientRect();
+    badge.style.left = r.right + "px";
+    badge.style.top = r.top + "px";
+  }
+  function repositionNotes() {
+    for (const [el, badge] of noteBadges) {
+      if (!el.isConnected) { if (badge.parentNode) badge.parentNode.removeChild(badge); noteBadges.delete(el); continue; }
+      positionBadge(badge, el);
+    }
+    if (notePop) positionPop(notePop.pop, notePop.el);
+  }
+  function clearNotes() {
+    closeNote(false);
+    for (const [, badge] of noteBadges) { if (badge.parentNode) badge.parentNode.removeChild(badge); }
+    noteBadges.clear();
+    notes.clear();
+  }
+
+  // ── BASELINE + SPEC ───────────────────────────────────────────────────────────
+  // Grava o estado ANTES da 1ª mutação (no-op se já existe) → "before" do spec.
+  function markBaseline(el) {
+    if (baselines.has(el)) return;
+    const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
+    const z = parseInt(getComputedStyle(el).zIndex, 10);
+    baselines.set(el, {
+      w: Math.round(el.offsetWidth),
+      h: Math.round(el.offsetHeight),
+      tx: m ? Math.round(parseFloat(m[1])) : 0,
+      ty: m ? Math.round(parseFloat(m[2])) : 0,
+      z: Number.isFinite(z) ? z : null,
+    });
+  }
+
+  // change-set determinístico: UNIÃO de geometria (changes) + intenção (notes). Elementos
+  // SÓ com nota entram como entradas de intenção pura. Cada item carrega âncora redundante.
+  function buildSpec() {
+    const els = new Set();
+    for (const c of changes.values()) if (c.el && c.el.isConnected) els.add(c.el);
+    for (const el of notes.keys()) if (el.isConnected) els.add(el);
+    const out = [];
+    for (const el of els) {
+      const c = changes.get(el);
+      const before = baselines.get(el) || null;
+      let after = null, delta = null;
+      if (c) {
+        after = { w: c.w, h: c.h, tx: c.tx || 0, ty: c.ty || 0, z: c.z != null ? c.z : null };
+        if (before) {
+          delta = {
+            dw: after.w - before.w, dh: after.h - before.h,
+            dx: after.tx - before.tx, dy: after.ty - before.ty,
+            dz: (after.z != null && before.z != null) ? after.z - before.z : null,
+          };
+        }
+      }
+      const n = notes.get(el);
+      const entry = {
+        anchor: anchorOf(el),
+        before, after, delta,
+        note: n ? (n.text || "") : "",
+        intents: n ? [...n.types] : [],
+      };
+      const constraint = c && c.snap ? snapToConstraint(c.snap) : null;
+      if (constraint) entry.constraint = constraint;
+      out.push(entry);
+    }
+    return out;
+  }
+
+  function specMarkdown(spec) {
+    const lines = ["# design-mode spec", "",
+      `${spec.length} elemento(s) — intenção visual do humano pro agente programador aplicar.`, ""];
+    let i = 0;
+    for (const it of spec) {
+      i++;
+      const a = it.anchor;
+      lines.push(`## ${i}. \`${a.selector || a.tag}\``);
+      const id = [];
+      if (a.text) id.push(`texto: "${a.text}"`);
+      if (a.role) id.push(`papel: ${a.role}`);
+      if (a.near) id.push(`perto de: "${a.near}"`);
+      if (id.length) lines.push("- âncora: " + id.join(" · "));
+      if (it.before && it.after) {
+        const b = it.before, af = it.after, segs = [];
+        if (b.w !== af.w || b.h !== af.h) segs.push(`tamanho ${b.w}×${b.h} → ${af.w}×${af.h}`);
+        if ((b.tx || 0) !== (af.tx || 0) || (b.ty || 0) !== (af.ty || 0))
+          segs.push(`posição translate(${b.tx},${b.ty}) → translate(${af.tx},${af.ty})`);
+        if (b.z !== af.z && af.z != null) segs.push(`z-index ${b.z == null ? "auto" : b.z} → ${af.z}`);
+        if (segs.length) lines.push("- [ ] " + segs.join("; "));
+      } else if (it.after) {
+        lines.push(`- [ ] tamanho ${it.after.w}×${it.after.h}, translate(${it.after.tx},${it.after.ty})` +
+          (it.after.z != null ? `, z-index ${it.after.z}` : ""));
+      }
+      if (it.constraint) lines.push("- dica de layout: " + it.constraint);
+      if (it.intents && it.intents.length) lines.push("- intenção: " + it.intents.join(", "));
+      if (it.note) lines.push("- nota: " + it.note);
+      lines.push("");
+    }
+    return lines.join("\n");
+  }
+
+  function copySpec() {
+    const spec = buildSpec();
+    if (!spec.length) { uiNotifySafe("Nada no spec — mova/redimensione algo ou anote (N) um elemento.", "warn"); return; }
+    const md = specMarkdown(spec);
+    const json = JSON.stringify(spec, null, 2);
+    writeClipboard(md + "\n```json\n" + json + "\n```\n", `Spec copiado (${spec.length} item(ns)).`);
+  }
+
+  function copyNotes() {
+    if (!notes.size) { uiNotifySafe("Nenhuma nota — selecione um elemento e tecle N.", "warn"); return; }
+    const arr = [];
+    for (const [el, n] of notes) {
+      if (!el.isConnected) continue;
+      arr.push({ anchor: anchorOf(el), intents: [...n.types], note: n.text || "" });
+    }
+    if (!arr.length) { uiNotifySafe("As notas eram de elementos já removidos.", "warn"); return; }
+    const lines = ["# design-mode notas", "", `${arr.length} elemento(s) anotado(s).`, ""];
+    let i = 0;
+    for (const it of arr) {
+      i++;
+      const a = it.anchor;
+      lines.push(`## ${i}. \`${a.selector || a.tag}\``);
+      const id = [];
+      if (a.text) id.push(`texto: "${a.text}"`);
+      if (a.role) id.push(`papel: ${a.role}`);
+      if (a.near) id.push(`perto de: "${a.near}"`);
+      if (id.length) lines.push("- âncora: " + id.join(" · "));
+      if (it.intents.length) lines.push("- intenção: " + it.intents.join(", "));
+      if (it.note) lines.push("- nota: " + it.note);
+      lines.push("");
+    }
+    writeClipboard(lines.join("\n") + "\n```json\n" + JSON.stringify(arr, null, 2) + "\n```\n",
+      `Notas copiadas (${arr.length}).`);
   }
 
   function uiNotifySafe(msg, kind) {
