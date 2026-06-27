@@ -33,6 +33,7 @@
   const baselines = new Map(); // el -> { w, h, tx, ty, z } ANTES da 1ª mutação (before do spec)
   const notes = new Map(); // el -> { types:Set<string>, text:string } (intenção em linguagem natural)
   const noteBadges = new Map(); // el -> badge overlay 📌 (NUNCA filho do alvo)
+  const detachOverlays = new Map(); // el -> overlay tracejado (solto do fluxo, FORA do alvo)
   let notePop = null; // popover de nota aberto (1 por vez)
   // Intenções tipadas (chips) — vocabulário curto e acionável pro agente programador.
   const INTENTS = [
@@ -50,6 +51,8 @@
   let mode = "off"; // "off" (dormente) | "select" (inspecionar) | "edit" (editor)
   let drag = null; // array de { el, btx, bty } (+ .sx/.sy) — move todos juntos
   let booted = false;
+  let nudgeSession = null; // { els:Set, t:number } — coalesce de undo p/ rajadas de seta (mover/resize teclado)
+  let alignKeep = true; // '@ manter': align vincula ao último selecionado (constraint mantida)
 
   const style = document.createElement("style");
   style.setAttribute("data-dm-style", ""); // marcador p/ remover do HTML salvo
@@ -91,6 +94,9 @@
     .dm-note-pop .dm-note-hint{color:#8aa;margin-top:5px;font-size:11px}
     .dm-note-badge{position:fixed;z-index:2147483646;font-size:14px;line-height:1;pointer-events:none;
       transform:translate(-50%,-50%);filter:drop-shadow(0 1px 2px #000)}
+    .dm-detach{position:fixed;z-index:2147483645;border:1px dashed #e6883c;pointer-events:none;
+      box-sizing:border-box;margin:0;padding:0;border-radius:2px}
+    .dm-bar #dm-keep.on{border-color:#e6a23c;background:#2a2113;color:#ffd27f}
   `;
 
   const bar = document.createElement("div");
@@ -100,7 +106,7 @@
     '<button id="dm-mode-edit" title="modo editor — mover, redimensionar, alinhar, agrupar, copiar/colar, apagar">✎ editar</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-static" title="modo estático — congela a página: não responde a cliques, dropdowns nem filtros">▣ estático: OFF</button>' +
-    '<button id="dm-parent" title="selecionar elemento pai">⬆ pai</button>' +
+    '<button id="dm-parent" title="selecionar elemento pai (Alt+↑) — Alt+↓ filho, Alt+←/→ irmãos">⬆ pai</button>' +
     '<span class="dm-grp dm-edit-only" id="dm-align" title="alinhar (2+ selecionados)">' +
       '<button data-al="left" title="alinhar à esquerda">⬅</button>' +
       '<button data-al="hcenter" title="centralizar horizontal">⬌</button>' +
@@ -108,6 +114,7 @@
       '<button data-al="top" title="alinhar ao topo">⬆</button>' +
       '<button data-al="vcenter" title="centralizar vertical">⬍</button>' +
       '<button data-al="bottom" title="alinhar à base">⬇</button>' +
+      '<button id="dm-keep" class="on" title="@ manter — alinha ao ÚLTIMO selecionado e MANTÉM a constraint: mover a referência reencosta os vinculados (ON por padrão)">@ manter</button>' +
     '</span>' +
     '<span class="dm-grp1 dm-edit-only" id="dm-layer-grp">' +
       '<button id="dm-front" title="trazer pro topo (z-index)">⤒ topo</button>' +
@@ -171,8 +178,9 @@
       bar.querySelector("#dm-back").addEventListener("click", () => layer("back"));
       bar.querySelector("#dm-group").addEventListener("click", groupSelected);
       bar.querySelector("#dm-ungroup").addEventListener("click", ungroupSelected);
-      bar.querySelectorAll("#dm-align button").forEach((b) =>
-        b.addEventListener("click", () => align(b.getAttribute("data-al"))));
+      bar.querySelectorAll("#dm-align button[data-al]").forEach((b) =>
+        b.addEventListener("click", () => align(b.getAttribute("data-al"), { keep: alignKeep })));
+      bar.querySelector("#dm-keep").addEventListener("click", toggleKeep);
       // âncoras dos overlays (badges de nota / popover) seguem o scroll e o resize
       window.addEventListener("scroll", repositionNotes, true);
       window.addEventListener("resize", repositionNotes, true);
@@ -266,6 +274,9 @@
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
     [guideV, guideH].forEach((g) => { if (g && g.parentNode) g.parentNode.removeChild(g); });
     guideV = guideH = null;
+    for (const [, ov] of detachOverlays) { if (ov.parentNode) ov.parentNode.removeChild(ov); }
+    detachOverlays.clear();
+    nudgeSession = null;
     clearNotes(); // remove badges 📌 + popover; zera o Map de notas
     baselines.clear();
     fileHandle = null; // esquece o arquivo aberto (File System Access API)
@@ -294,9 +305,50 @@
       if (selected.size === 1) { e.preventDefault(); openNote([...selected][0]); }
       return;
     }
+    // Navegar o DOM (Alt+setas) — SÓ-leitura, vale em select E edit: pai / filho / irmãos.
+    if (e.altKey && e.key.indexOf("Arrow") === 0) {
+      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (selected.size !== 1) return;
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === "ArrowUp") selectParent();
+      else if (e.key === "ArrowDown") selectChild();
+      else if (e.key === "ArrowLeft") selectSibling(-1);
+      else if (e.key === "ArrowRight") selectSibling(1);
+      scrollSelIntoView();
+      return;
+    }
     // ── daqui pra baixo: só no modo editor ──
     if (mode !== "edit") return;
-    if (mod && (e.key === "g" || e.key === "G")) { e.preventDefault(); if (e.shiftKey) ungroupSelected(); else groupSelected(); }
+    // Mover / redimensionar pela seta (setas SEM Alt; Alt já tratado acima).
+    if (!e.altKey && e.key.indexOf("Arrow") === 0) {
+      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (selected.size === 0) return; // no-op: deixa a página rolar
+      e.preventDefault(); e.stopPropagation();
+      const step = e.shiftKey ? 10 : 1;
+      if (mod) {
+        // Redimensionar (lote): →/↓ maior, ←/↑ menor. Âncora no top-left.
+        if (e.key === "ArrowRight") resizeStep(step, 0);
+        else if (e.key === "ArrowLeft") resizeStep(-step, 0);
+        else if (e.key === "ArrowDown") resizeStep(0, step);
+        else if (e.key === "ArrowUp") resizeStep(0, -step);
+      } else {
+        // Mover (lote): passo fino 1px / Shift 10px.
+        if (e.key === "ArrowRight") nudge(step, 0);
+        else if (e.key === "ArrowLeft") nudge(-step, 0);
+        else if (e.key === "ArrowDown") nudge(0, step);
+        else if (e.key === "ArrowUp") nudge(0, -step);
+      }
+      return;
+    }
+    // qualquer outro ramo de edição encerra a sessão de nudge/resize coalescida
+    nudgeSession = null;
+    // Soltar do fluxo (P) / devolver ao fluxo (Shift+P).
+    if (!mod && (e.key === "p" || e.key === "P")) {
+      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      e.preventDefault(); e.stopPropagation();
+      detachSelection(e.shiftKey);
+    }
+    else if (mod && (e.key === "g" || e.key === "G")) { e.preventDefault(); if (e.shiftKey) ungroupSelected(); else groupSelected(); }
     else if (mod && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undo(); }
     else if (mod && (e.key === "v" || e.key === "V")) { e.preventDefault(); pasteElements(); }
     else if (e.key === "]") { e.preventDefault(); layer("up"); }
@@ -330,8 +382,9 @@
     for (const m of groupMembers(el)) { selected.add(m); m.classList.add("dm-sel", "dm-editable"); }
     updateCur();
   }
-  function selectOnly(el) { clearSel(); addSel(el); }
+  function selectOnly(el) { nudgeSession = null; clearSel(); addSel(el); }
   function toggleSel(el) {
+    nudgeSession = null;
     const mem = groupMembers(el);
     const has = selected.has(el);
     for (const m of mem) {
@@ -341,6 +394,7 @@
     updateCur();
   }
   function clearSel() {
+    nudgeSession = null; // Escape também fecha a sessão de nudge/resize coalescida
     selected.forEach((e) => e.classList.remove("dm-sel"));
     selected.clear();
     updateCur();
@@ -350,6 +404,43 @@
     if (selected.size !== 1) return;
     const el = [...selected][0];
     if (el.parentElement && el.parentElement !== document.body) selectOnly(el.parentElement);
+  }
+
+  // Filhos-elemento "navegáveis": pula nós dm-* (barra/guias/badges/overlays) e os sem
+  // caixa (display:none / 0×0). offsetParent==null cobre o caso normal; o rect cobre
+  // position:fixed e file:// onde offsetParent pode mentir.
+  function elementChildrenOf(el) {
+    if (!el || !el.children) return [];
+    return [...el.children].filter((c) => {
+      if (c.nodeType !== 1) return false;
+      if (c.classList && [...c.classList].some((k) => k.indexOf("dm-") === 0)) return false;
+      if (c.offsetParent != null) return true;
+      const r = c.getBoundingClientRect();
+      return r.width > 0 || r.height > 0;
+    });
+  }
+  function selectChild() {
+    if (selected.size !== 1) return;
+    const kids = elementChildrenOf([...selected][0]);
+    if (kids.length) selectOnly(kids[0]);
+  }
+  function selectSibling(dir) {
+    if (selected.size !== 1) return;
+    const el = [...selected][0];
+    const parent = el.parentElement;
+    if (!parent) return;
+    const sibs = elementChildrenOf(parent);
+    const i = sibs.indexOf(el);
+    if (i === -1 || sibs.length < 2) return;
+    selectOnly(sibs[(i + dir + sibs.length) % sibs.length]); // envolve nas pontas
+  }
+  // Traz a seleção (1 elemento) pra viewport se estiver fora — acompanha a navegação.
+  function scrollSelIntoView() {
+    if (selected.size !== 1) return;
+    const el = [...selected][0];
+    const r = el.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth)
+      try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) { el.scrollIntoView(); }
   }
 
   function updateCur() {
@@ -370,6 +461,7 @@
     if (pasteEl) pasteEl.disabled = clipboard.length === 0;
     if (noteEl) { noteEl.disabled = n !== 1; noteEl.classList.toggle("on", n === 1 && notes.has([...selected][0])); }
     if (copyNotesEl) copyNotesEl.disabled = notes.size === 0;
+    syncDetachOverlays(); // overlays tracejados acompanham o estado de detach (e o undo)
     const cur = bar.querySelector("#dm-cur");
     if (!cur) return;
     // contador combinado: edições geométricas + notas de intenção
@@ -393,6 +485,8 @@
       height: el.style.height,
       zIndex: el.style.zIndex,
       position: el.style.position,
+      top: el.style.top,
+      left: el.style.left,
       change: changes.has(el) ? Object.assign({}, changes.get(el)) : null,
     };
   }
@@ -441,6 +535,8 @@
       s.el.style.height = s.height;
       if (s.zIndex !== undefined) s.el.style.zIndex = s.zIndex;
       if (s.position !== undefined) s.el.style.position = s.position;
+      if (s.top !== undefined) s.el.style.top = s.top;
+      if (s.left !== undefined) s.el.style.left = s.left;
       if (s.change) changes.set(s.el, s.change);
       else changes.delete(s.el);
     }
@@ -565,31 +661,185 @@
 
   // ── alinhamento (precisa de 2+ selecionados) ──
   function avg(a) { return a.reduce((s, n) => s + n, 0) / a.length; }
-  function align(kind) {
+  // Aresta de um rect pra um dado 'kind' de alinhamento (px na viewport).
+  function edgePos(r, kind) {
+    if (kind === "left") return r.left;
+    if (kind === "right") return r.right;
+    if (kind === "top") return r.top;
+    if (kind === "bottom") return r.bottom;
+    if (kind === "hcenter") return r.left + r.width / 2;
+    if (kind === "vcenter") return r.top + r.height / 2;
+    return 0;
+  }
+  function isHAlign(kind) { return kind === "left" || kind === "right" || kind === "hcenter"; }
+  // align(kind, {keep}): keep=false → one-shot clássico (min/max/avg, move todos).
+  // keep=true → alinha ao ÚLTIMO selecionado (referência) e grava a regra em c.rule pra
+  // reapplyRules() reencostar quando a referência se mexer depois.
+  function align(kind, opts) {
+    const keep = !!(opts && opts.keep);
     const els = [...selected];
     if (els.length < 2) { uiNotifySafe("Selecione 2+ elementos (Shift+clique) pra alinhar.", "warn"); return; }
     pushUndo(els);
     for (const el of els) markBaseline(el); // "before" do spec antes de alinhar
     const items = els.map((el) => ({ el, r: el.getBoundingClientRect() }));
-    let target;
-    if (kind === "left") target = Math.min(...items.map((o) => o.r.left));
-    else if (kind === "right") target = Math.max(...items.map((o) => o.r.right));
-    else if (kind === "top") target = Math.min(...items.map((o) => o.r.top));
-    else if (kind === "bottom") target = Math.max(...items.map((o) => o.r.bottom));
-    else if (kind === "hcenter") target = avg(items.map((o) => o.r.left + o.r.width / 2));
-    else if (kind === "vcenter") target = avg(items.map((o) => o.r.top + o.r.height / 2));
-    for (const o of items) {
+    const refItem = items[items.length - 1]; // referência = último selecionado
+    let target, movers;
+    if (keep) {
+      target = edgePos(refItem.r, kind);
+      movers = items.filter((o) => o !== refItem); // a referência não se mexe
+    } else {
+      if (kind === "left") target = Math.min(...items.map((o) => o.r.left));
+      else if (kind === "right") target = Math.max(...items.map((o) => o.r.right));
+      else if (kind === "top") target = Math.min(...items.map((o) => o.r.top));
+      else if (kind === "bottom") target = Math.max(...items.map((o) => o.r.bottom));
+      else if (kind === "hcenter") target = avg(items.map((o) => o.r.left + o.r.width / 2));
+      else if (kind === "vcenter") target = avg(items.map((o) => o.r.top + o.r.height / 2));
+      movers = items;
+    }
+    const refSel = keep ? selectorOf(refItem.el) : null;
+    for (const o of movers) {
       const c = changes.get(o.el) || {};
       let tx = c.tx || 0, ty = c.ty || 0;
-      if (kind === "left") tx += target - o.r.left;
-      else if (kind === "right") tx += target - o.r.right;
-      else if (kind === "hcenter") tx += target - (o.r.left + o.r.width / 2);
-      else if (kind === "top") ty += target - o.r.top;
-      else if (kind === "bottom") ty += target - o.r.bottom;
-      else if (kind === "vcenter") ty += target - (o.r.top + o.r.height / 2);
+      if (isHAlign(kind)) tx += target - edgePos(o.r, kind);
+      else ty += target - edgePos(o.r, kind);
       o.el.style.transform = `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`;
       record(o.el);
+      if (keep) {
+        const cc = changes.get(o.el); // record() recria o objeto → anexar a regra DEPOIS
+        if (cc) cc.rule = { kind: "align", edge: kind, axis: isHAlign(kind) ? "H" : "V", ref: { selector: refSel, edge: kind } };
+      } else {
+        const cc = changes.get(o.el); if (cc) delete cc.rule; // one-shot limpa constraint antiga
+      }
     }
+    if (keep) uiNotifySafe(`Alinhado e MANTIDO (${movers.length}) à referência ${refSel}.`, "ok");
+  }
+  function toggleKeep() {
+    alignKeep = !alignKeep;
+    const btn = bar.querySelector("#dm-keep");
+    if (btn) btn.classList.toggle("on", alignKeep);
+    uiNotifySafe(alignKeep ? "Manter alinhamento: ON (vincula ao último selecionado)." : "Manter alinhamento: OFF (align one-shot).", "ok");
+  }
+  // Reencosta os elementos com regra 'align' à sua referência (chamada no fim de
+  // drag/nudge/resize). Sem pushUndo: faz parte da ação que disparou. record() dropa
+  // c.rule → reanexa depois pra a constraint sobreviver.
+  function reapplyRules() {
+    for (const [el, c] of changes) {
+      if (!c.rule || c.rule.kind !== "align" || !el.isConnected) continue;
+      let ref = null;
+      try { ref = document.querySelector(c.rule.ref.selector); } catch (_) { ref = null; }
+      if (!ref || ref === el || !ref.isConnected) continue;
+      markBaseline(el);
+      const rr = ref.getBoundingClientRect();
+      const er = el.getBoundingClientRect();
+      const kind = c.rule.edge;
+      let tx = c.tx || 0, ty = c.ty || 0;
+      if (isHAlign(kind)) tx += edgePos(rr, kind) - edgePos(er, kind);
+      else ty += edgePos(rr, kind) - edgePos(er, kind);
+      el.style.transform = `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`;
+      const rule = c.rule;
+      record(el);
+      const cc = changes.get(el);
+      if (cc) cc.rule = rule;
+    }
+  }
+
+  // ── mover / redimensionar pela seta (modo edit) ───────────────────────────────
+  // Coalesce de undo: uma rajada na MESMA seleção dentro de ~600ms reusa o snapshot
+  // (1 só Ctrl+Z desfaz tudo). markBaseline garante o "before" do spec; record() entra
+  // em changes (exportável). Sem snap (delta numérico puro). reapplyRules mantém as
+  // constraints '@ manter' encostadas.
+  function ensureNudgeSession(els) {
+    const now = Date.now();
+    const same = nudgeSession && nudgeSession.els.size === els.length &&
+      els.every((e) => nudgeSession.els.has(e));
+    if (same && now - nudgeSession.t < 600) { nudgeSession.t = now; return; }
+    pushUndo(els);
+    nudgeSession = { els: new Set(els), t: now };
+  }
+  function nudge(dx, dy) {
+    const els = [...selected];
+    if (!els.length) return;
+    ensureNudgeSession(els);
+    for (const el of els) {
+      markBaseline(el);
+      const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
+      const tx = (m ? parseFloat(m[1]) : 0) + dx;
+      const ty = (m ? parseFloat(m[2]) : 0) + dy;
+      el.style.transform = `translate(${tx}px, ${ty}px)`;
+      record(el);
+    }
+    reapplyRules();
+    repositionNotes();
+  }
+  function resizeStep(dw, dh) {
+    const els = [...selected];
+    if (!els.length) return;
+    ensureNudgeSession(els);
+    let last = null;
+    for (const el of els) {
+      markBaseline(el);
+      if (dw) el.style.width = Math.max(8, el.offsetWidth + dw) + "px"; // clamp 8px
+      if (dh) el.style.height = Math.max(8, el.offsetHeight + dh) + "px";
+      record(el);
+      last = el;
+    }
+    reapplyRules();
+    repositionNotes();
+    if (last) { const c = bar.querySelector("#dm-cur"); if (c) c.textContent = `${last.offsetWidth}×${last.offsetHeight}` + (els.length > 1 ? ` (+${els.length - 1})` : ""); }
+  }
+
+  // ── soltar do fluxo (P) / devolver (Shift+P) ──────────────────────────────────
+  // P: position:absolute com top/left:auto — a posição estática segura o lugar visual;
+  // os irmãos colapsam e o translate existente segue deslocando. Shift+P volta a static.
+  // c.struct é metadado SÓ no Map (limpo no save); o overlay tracejado vive FORA do alvo.
+  function detachSelection(back) {
+    const els = [...selected];
+    if (!els.length) { uiNotifySafe("Selecione 1+ elemento(s) pra soltar do fluxo.", "warn"); return; }
+    pushUndo(els);
+    for (const el of els) markBaseline(el);
+    for (const el of els) {
+      if (back) { el.style.position = ""; el.style.top = ""; el.style.left = ""; }
+      else { el.style.position = "absolute"; el.style.top = "auto"; el.style.left = "auto"; }
+      record(el);
+      const c = changes.get(el); // record() recria o objeto → anexar struct DEPOIS
+      if (c) {
+        if (back) delete c.struct;
+        else c.struct = { kind: "detach", position: "absolute", parent: selectorOf(el.parentElement) };
+      }
+    }
+    reapplyRules();
+    repositionNotes();
+    uiNotifySafe(back ? `${els.length} devolvido(s) ao fluxo (static).` : `${els.length} solto(s) do fluxo (position:absolute).`, "ok");
+  }
+  // overlay tracejado laranja FORA do alvo enquanto detached (não muta o DOM da página).
+  function positionDetach(ov, el) {
+    const r = el.getBoundingClientRect();
+    ov.style.left = r.left + "px"; ov.style.top = r.top + "px";
+    ov.style.width = r.width + "px"; ov.style.height = r.height + "px";
+  }
+  function refreshDetach(el) {
+    const c = changes.get(el);
+    const on = !!(c && c.struct && c.struct.kind === "detach" && el.isConnected);
+    let ov = detachOverlays.get(el);
+    if (on) {
+      if (!ov) {
+        ov = document.createElement("div");
+        ov.className = "dm-detach";
+        (document.body || document.documentElement).appendChild(ov);
+        detachOverlays.set(el, ov);
+      }
+      positionDetach(ov, el);
+    } else if (ov) {
+      if (ov.parentNode) ov.parentNode.removeChild(ov);
+      detachOverlays.delete(el);
+    }
+  }
+  // reconcilia os overlays de detach com o estado atual de changes (chamado em updateCur).
+  function syncDetachOverlays() {
+    const want = new Set();
+    for (const [el, c] of changes) if (c.struct && c.struct.kind === "detach" && el.isConnected) want.add(el);
+    for (const el of want) refreshDetach(el);
+    for (const el of [...detachOverlays.keys()]) if (!want.has(el)) refreshDetach(el);
   }
 
   // ── ordem de camadas (z-index): subir/descer/topo/fundo ──
@@ -719,6 +969,7 @@
   }
 
   function onDown(e) {
+    nudgeSession = null; // qualquer clique encerra a sessão de nudge/resize coalescida
     if (inBar(e.target)) return; // não captura cliques na própria barra
     if (notePop) {
       if (notePop.pop.contains(e.target)) return; // interagindo com o popover (chips/textarea)
@@ -800,6 +1051,7 @@
           c.snap = snap;
         }
       }
+      reapplyRules(); // mover a referência reencosta os vinculados ('@ manter')
     }
     drag = null;
     showGuide("v", null);
@@ -827,6 +1079,14 @@
     if (snap.y) parts.push(constraintPhrase(snap.y, "V"));
     return parts.length ? parts.join(" · ") : null;
   }
+  // Frase da constraint mantida ('@ manter') — vai pro spec/layout pro agente entender
+  // que NÃO é um translate cru, é um alinhamento vinculado.
+  function ruleConstraint(c) {
+    if (!c || !c.rule || c.rule.kind !== "align") return null;
+    const name = { left: "left", right: "right", hcenter: "center-H", top: "top", bottom: "bottom", vcenter: "center-V" };
+    const e = name[c.rule.edge] || c.rule.edge;
+    return `${e} aligned to ${c.rule.ref.selector} [mantido]`;
+  }
   function constraintPhrase(s, axis) {
     if (s.kind === "parent" && (s.targetEdge === "centerX" || s.targetEdge === "centerY")) {
       return `center-${axis} in parent (${s.targetSelector})`;
@@ -838,14 +1098,20 @@
   function record(el) {
     const prev = changes.get(el) || {};
     const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
-    changes.set(el, {
+    const c = {
       w: Math.round(el.offsetWidth),
       h: Math.round(el.offsetHeight),
       tx: m ? Math.round(parseFloat(m[1])) : prev.tx || 0,
       ty: m ? Math.round(parseFloat(m[2])) : prev.ty || 0,
       z: prev.z,
       el,
-    });
+    };
+    // metadados "grudentos" sobrevivem ao record: struct (solto do fluxo), rule (align
+    // mantido) e posForced (position forçado p/ z-index). snap NÃO — tem ciclo próprio (onUp).
+    if (prev.posForced) c.posForced = prev.posForced;
+    if (prev.struct) c.struct = prev.struct;
+    if (prev.rule) c.rule = prev.rule;
+    changes.set(el, c);
     updateCur();
   }
 
@@ -983,12 +1249,17 @@
       if (!c.el.isConnected) continue; // ignora nós já removidos
       const decls = [`  width: ${c.w}px;`, `  height: ${c.h}px;`];
       if (c.tx || c.ty) decls.push(`  transform: translate(${c.tx}px, ${c.ty}px);`);
+      const detached = c.struct && c.struct.kind === "detach";
+      if (detached) decls.push(`  position: ${c.struct.position};`);
       if (c.z != null) {
-        if (c.posForced) decls.push(`  position: relative;`);
+        if (c.posForced && !detached) decls.push(`  position: relative;`);
         decls.push(`  z-index: ${c.z};`);
       }
-      // dica de layout (constraint do snap) — NÃO substitui o px, só explica a intenção.
-      if (c.snap) { const ph = snapToConstraint(c.snap); if (ph) decls.push(`  /* layout hint: ${ph} */`); }
+      // dica de layout (constraint do snap / align mantido) — NÃO substitui o px, só explica.
+      const rc = ruleConstraint(c);
+      if (rc) decls.push(`  /* layout hint: ${rc} */`);
+      else if (c.snap) { const ph = snapToConstraint(c.snap); if (ph) decls.push(`  /* layout hint: ${ph} */`); }
+      if (detached) decls.push(`  /* layout hint: solto do fluxo, ancorado em ${c.struct.parent} */`);
       blocks.push(`${selectorOf(c.el)} {\n${decls.join("\n")}\n}`);
     }
     const css = "/* design-mode export — colar no styles.css */\n" + blocks.join("\n\n") + "\n";
@@ -1013,7 +1284,7 @@
   // data-dm* de todo nó. As edições (estilos inline de transform/width/...) permanecem.
   function serializeCleanHTML() {
     const root = document.documentElement.cloneNode(true);
-    root.querySelectorAll(".dm-bar, .dm-guide, .dm-note-pop, .dm-note-badge, [data-dm-style]")
+    root.querySelectorAll(".dm-bar, .dm-guide, .dm-note-pop, .dm-note-badge, .dm-detach, [data-dm-style]")
       .forEach((n) => n.remove());
     const all = [root, ...root.querySelectorAll("*")];
     for (const n of all) {
@@ -1179,6 +1450,10 @@
       if (!el.isConnected) { if (badge.parentNode) badge.parentNode.removeChild(badge); noteBadges.delete(el); continue; }
       positionBadge(badge, el);
     }
+    for (const [el, ov] of detachOverlays) {
+      if (!el.isConnected) { if (ov.parentNode) ov.parentNode.removeChild(ov); detachOverlays.delete(el); continue; }
+      positionDetach(ov, el);
+    }
     if (notePop) positionPop(notePop.pop, notePop.el);
   }
   function clearNotes() {
@@ -1231,8 +1506,11 @@
         note: n ? (n.text || "") : "",
         intents: n ? [...n.types] : [],
       };
-      const constraint = c && c.snap ? snapToConstraint(c.snap) : null;
+      const constraint = (c && ruleConstraint(c)) || (c && c.snap ? snapToConstraint(c.snap) : null);
       if (constraint) entry.constraint = constraint;
+      if (c && c.struct && c.struct.kind === "detach") {
+        entry.struct = { kind: "detach", position: c.struct.position, parent: c.struct.parent };
+      }
       out.push(entry);
     }
     return out;
@@ -1263,6 +1541,8 @@
           (it.after.z != null ? `, z-index ${it.after.z}` : ""));
       }
       if (it.constraint) lines.push("- dica de layout: " + it.constraint);
+      if (it.struct && it.struct.kind === "detach")
+        lines.push(`- estrutura: tirar do fluxo (position:${it.struct.position}, ancorado em ${it.struct.parent})`);
       if (it.intents && it.intents.length) lines.push("- intenção: " + it.intents.join(", "));
       if (it.note) lines.push("- nota: " + it.note);
       lines.push("");
