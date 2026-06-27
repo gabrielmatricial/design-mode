@@ -52,6 +52,7 @@
   let booted = false;
 
   const style = document.createElement("style");
+  style.setAttribute("data-dm-style", ""); // marcador p/ remover do HTML salvo
   style.textContent = `
     .dm-bar{position:fixed;z-index:2147483647;right:12px;bottom:12px;display:flex;gap:5px;
       align-items:center;font:12px ui-monospace,monospace;background:#11151b;color:#cfe;flex-wrap:wrap;max-width:96vw;
@@ -123,6 +124,9 @@
     '<button id="dm-copy" class="dm-edit-only" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
     '<button id="dm-copyspec" title="copiar SPEC (geometria + intenção) em Markdown + JSON pro agente programador">🧾 copiar spec</button>' +
     '<button id="dm-copynotes" title="copiar só as notas/intenções (Markdown + JSON)">🗒 copiar notas</button>' +
+    '<span class="dm-sep"></span>' +
+    '<button id="dm-save" title="salvar o HTML da página no arquivo (Ctrl+S) — sobrescreve em localhost/https, baixa cópia em file://">💾 salvar</button>' +
+    '<button id="dm-saveas" title="salvar como… — escolher arquivo/destino (Ctrl+Shift+S)">💾 salvar como…</button>' +
     '<span class="dm-sep dm-edit-only"></span>' +
     '<button id="dm-paste" class="dm-edit-only" title="colar elemento(s) (Ctrl+V)" disabled>⊕ colar</button>' +
     '<button id="dm-del" class="dm-edit-only" title="apagar selecionado(s) (Del)" disabled>🗑 apagar</button>' +
@@ -152,6 +156,8 @@
       bar.querySelector("#dm-note").addEventListener("click", () => { if (selected.size === 1) openNote([...selected][0]); });
       bar.querySelector("#dm-copyspec").addEventListener("click", copySpec);
       bar.querySelector("#dm-copynotes").addEventListener("click", copyNotes);
+      bar.querySelector("#dm-save").addEventListener("click", () => saveFile(false));
+      bar.querySelector("#dm-saveas").addEventListener("click", () => saveFile(true));
       bar.querySelector("#dm-reset").addEventListener("click", resetAll);
       bar.querySelector("#dm-undo").addEventListener("click", undo);
       bar.querySelector("#dm-copyel").addEventListener("click", copyElements);
@@ -262,6 +268,7 @@
     guideV = guideH = null;
     clearNotes(); // remove badges 📌 + popover; zera o Map de notas
     baselines.clear();
+    fileHandle = null; // esquece o arquivo aberto (File System Access API)
     window.removeEventListener("scroll", repositionNotes, true);
     window.removeEventListener("resize", repositionNotes, true);
     if (bar.parentNode) bar.parentNode.removeChild(bar);
@@ -278,6 +285,9 @@
     // ── valem nos dois modos (não mutam o layout) ──
     if (e.key === "Escape") { clearSel(); return; }
     if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyElements(); return; }
+    // Salvar (Ctrl+S) / Salvar como (Ctrl+Shift+S) — vale nos dois modos; bloqueia o
+    // diálogo nativo "salvar página" do navegador.
+    if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); saveFile(e.shiftKey); return; }
     // Nota (intenção): 'N' com exatamente 1 selecionado — vale em select e edit.
     if (!mod && (e.key === "n" || e.key === "N")) {
       if (isEditableTarget(e.target) || inBar(e.target)) return;
@@ -983,6 +993,77 @@
     }
     const css = "/* design-mode export — colar no styles.css */\n" + blocks.join("\n\n") + "\n";
     writeClipboard(css, `Layout copiado (${blocks.length} bloco(s)).`);
+  }
+
+  // ── SALVAR / SALVAR COMO (HTML da página) ─────────────────────────────────────
+  // Híbrido: em contexto seguro (http://localhost / https) usa a File System Access API
+  // e SOBRESCREVE o arquivo no lugar (mantém o handle p/ os próximos "salvar" sem
+  // diálogo). Em file:// (sem essa API) cai pra BAIXAR uma cópia.
+  let fileHandle = null; // handle retido do arquivo aberto (File System Access API)
+
+  function suggestedFileName() {
+    try {
+      const base = decodeURIComponent(location.pathname).split("/").pop();
+      return base && /\.[a-z0-9]+$/i.test(base) ? base : "pagina.html";
+    } catch (_) { return "pagina.html"; }
+  }
+
+  // Serializa o documento ATUAL limpo dos artefatos da ferramenta: remove a barra, o
+  // <style> injetado, guias, badges e popover de nota; tira classes dm-* e atributos
+  // data-dm* de todo nó. As edições (estilos inline de transform/width/...) permanecem.
+  function serializeCleanHTML() {
+    const root = document.documentElement.cloneNode(true);
+    root.querySelectorAll(".dm-bar, .dm-guide, .dm-note-pop, .dm-note-badge, [data-dm-style]")
+      .forEach((n) => n.remove());
+    const all = [root, ...root.querySelectorAll("*")];
+    for (const n of all) {
+      if (n.classList && n.classList.length) {
+        for (const c of [...n.classList]) if (c.indexOf("dm-") === 0) n.classList.remove(c);
+        if (!n.classList.length) n.removeAttribute("class");
+      }
+      if (n.getAttributeNames) for (const a of n.getAttributeNames()) if (a.indexOf("data-dm") === 0) n.removeAttribute(a);
+    }
+    const dt = document.doctype ? "<!doctype " + document.doctype.name + ">\n" : "";
+    return dt + root.outerHTML + "\n";
+  }
+
+  function downloadFile(text, name) {
+    const blob = new Blob([text], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    uiNotifySafe(`Baixado "${name}" (cópia — salve por cima do original se quiser).`, "ok");
+  }
+
+  // asNew=true força escolher arquivo/destino (Salvar como). asNew=false reusa o handle.
+  async function saveFile(asNew) {
+    const html = serializeCleanHTML();
+    // Caminho 1 — File System Access API (sobrescreve no lugar). Só existe em contexto
+    // seguro (localhost/https); em file:// window.showSaveFilePicker é undefined → fallback.
+    if (window.showSaveFilePicker) {
+      try {
+        if (asNew || !fileHandle) {
+          fileHandle = await window.showSaveFilePicker({
+            suggestedName: suggestedFileName(),
+            types: [{ description: "HTML", accept: { "text/html": [".html", ".htm"] } }],
+          });
+        }
+        const w = await fileHandle.createWritable();
+        await w.write(html);
+        await w.close();
+        uiNotifySafe(`Salvo em "${fileHandle.name || "arquivo"}".`, "ok");
+        return;
+      } catch (e) {
+        if (e && e.name === "AbortError") return; // usuário cancelou o diálogo
+        console.warn("[design-mode] showSaveFilePicker falhou, baixando cópia:", e);
+      }
+    }
+    // Caminho 2 — download (file:// e fallback geral)
+    downloadFile(html, suggestedFileName());
   }
 
   function resetAll() {
