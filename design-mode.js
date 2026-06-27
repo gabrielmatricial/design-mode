@@ -301,13 +301,13 @@
     if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); saveFile(e.shiftKey); return; }
     // Nota (intenção): 'N' com exatamente 1 selecionado — vale em select e edit.
     if (!mod && (e.key === "n" || e.key === "N")) {
-      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (isEditableTarget(e.target)) return; // só barra campo de texto; foco na barra NÃO bloqueia
       if (selected.size === 1) { e.preventDefault(); openNote([...selected][0]); }
       return;
     }
     // Navegar o DOM (Alt+setas) — SÓ-leitura, vale em select E edit: pai / filho / irmãos.
     if (e.altKey && e.key.indexOf("Arrow") === 0) {
-      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (isEditableTarget(e.target)) return; // só barra campo de texto; foco na barra NÃO bloqueia
       if (selected.size !== 1) return;
       e.preventDefault(); e.stopPropagation();
       if (e.key === "ArrowUp") selectParent();
@@ -321,7 +321,7 @@
     if (mode !== "edit") return;
     // Mover / redimensionar pela seta (setas SEM Alt; Alt já tratado acima).
     if (!e.altKey && e.key.indexOf("Arrow") === 0) {
-      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (isEditableTarget(e.target)) return; // só barra campo de texto; foco na barra NÃO bloqueia
       if (selected.size === 0) return; // no-op: deixa a página rolar
       e.preventDefault(); e.stopPropagation();
       const step = e.shiftKey ? 10 : 1;
@@ -344,7 +344,7 @@
     nudgeSession = null;
     // Soltar do fluxo (P) / devolver ao fluxo (Shift+P).
     if (!mod && (e.key === "p" || e.key === "P")) {
-      if (isEditableTarget(e.target) || inBar(e.target)) return;
+      if (isEditableTarget(e.target)) return; // só barra campo de texto; foco na barra NÃO bloqueia
       e.preventDefault(); e.stopPropagation();
       detachSelection(e.shiftKey);
     }
