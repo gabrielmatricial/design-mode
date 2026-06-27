@@ -9,10 +9,13 @@
  * undo (Ctrl+Z), copy/paste elements (Ctrl+C / Ctrl+V), delete (Del),
  * export CSS ("copiar layout"), quit (✕ — removes the tool from the page).
  *
- * While ON the page is INERT: clicks/links/buttons/forms do not respond
- * (you're editing layout, not using the page). Turn OFF to restore.
+ * Two active modes: SELECT (🔍 inspecionar) only selects/inspects elements —
+ * never moves or resizes them, safe for investigating; EDIT (✎ editar) is the
+ * full editor (move/resize/align/group/copy/paste/delete). Pair with STATIC
+ * (▣ estático) to freeze the page's own clicks/dropdowns/forms.
  *
- * Public API: window.DesignMode.enable() / .disable() / .toggle() / .quit()
+ * Public API: window.DesignMode.select() / .edit() / .setMode("off"|"select"|"edit")
+ *   / .toggle() / .quit() / .isEditing() / .mode()
  *
  * MIT License.
  */
@@ -30,7 +33,7 @@
   const selected = new Set(); // seleção MÚLTIPLA (Shift+clique adiciona)
   const undoStack = []; // pilha de snapshots p/ desfazer (Ctrl+Z)
   const clipboard = []; // outerHTML dos elementos copiados (Ctrl+C)
-  let on = false;
+  let mode = "off"; // "off" (dormente) | "select" (inspecionar) | "edit" (editor)
   let drag = null; // array de { el, btx, bty } (+ .sx/.sy) — move todos juntos
   let booted = false;
 
@@ -50,10 +53,12 @@
     .dm-bar .dm-grp1{display:none;gap:4px}
     .dm-bar.dm-has-sel .dm-grp1{display:flex}
     .dm-bar .dm-cur{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8aa}
-    body.dm-on *:hover{outline:1px dashed #5b8a !important}
+    body.dm-active *:hover{outline:1px dashed #5b8a !important}
     .dm-sel{outline:2px solid #1dc077 !important;outline-offset:1px}
     .dm-grouped{outline:1px dashed #c9a227 !important;outline-offset:1px}
-    body.dm-on .dm-editable{resize:both;overflow:auto}
+    body.dm-edit .dm-editable{resize:both;overflow:auto}
+    .dm-bar:not(.dm-editing) .dm-edit-only{display:none !important}
+    .dm-bar #dm-mode-select.on{border-color:#4aa3ff;background:#0f1f2e;color:#9fd0ff}
     .dm-guide{position:fixed;z-index:2147483646;background:#ff3b8d;pointer-events:none;margin:0;padding:0}
     .dm-guide.dm-guide-v{top:0;width:1px;height:100vh}
     .dm-guide.dm-guide-h{left:0;height:1px;width:100vw}
@@ -62,10 +67,12 @@
   const bar = document.createElement("div");
   bar.className = "dm-bar";
   bar.innerHTML =
-    '<button id="dm-toggle">✎ design: OFF</button>' +
+    '<button id="dm-mode-select" title="modo seletor — só inspeciona/seleciona; NÃO move nem redimensiona (seguro pra investigar)">🔍 inspecionar</button>' +
+    '<button id="dm-mode-edit" title="modo editor — mover, redimensionar, alinhar, agrupar, copiar/colar, apagar">✎ editar</button>' +
+    '<span class="dm-sep"></span>' +
     '<button id="dm-static" title="modo estático — congela a página: não responde a cliques, dropdowns nem filtros">▣ estático: OFF</button>' +
     '<button id="dm-parent" title="selecionar elemento pai">⬆ pai</button>' +
-    '<span class="dm-grp" id="dm-align" title="alinhar (2+ selecionados)">' +
+    '<span class="dm-grp dm-edit-only" id="dm-align" title="alinhar (2+ selecionados)">' +
       '<button data-al="left" title="alinhar à esquerda">⬅</button>' +
       '<button data-al="hcenter" title="centralizar horizontal">⬌</button>' +
       '<button data-al="right" title="alinhar à direita">➡</button>' +
@@ -73,7 +80,7 @@
       '<button data-al="vcenter" title="centralizar vertical">⬍</button>' +
       '<button data-al="bottom" title="alinhar à base">⬇</button>' +
     '</span>' +
-    '<span class="dm-grp1" id="dm-layer-grp">' +
+    '<span class="dm-grp1 dm-edit-only" id="dm-layer-grp">' +
       '<button id="dm-front" title="trazer pro topo (z-index)">⤒ topo</button>' +
       '<button id="dm-up" title="subir uma camada (])">↑</button>' +
       '<button id="dm-down" title="descer uma camada ([)">↓</button>' +
@@ -81,16 +88,16 @@
       '<button id="dm-group" title="agrupar selecionados (Ctrl+G)">▣ agrupar</button>' +
       '<button id="dm-ungroup" title="desagrupar (Ctrl+Shift+G)">▢ desagrupar</button>' +
     '</span>' +
-    '<span class="dm-sep"></span>' +
+    '<span class="dm-sep dm-edit-only"></span>' +
     '<button id="dm-copyel" title="copiar HTML do(s) elemento(s) pro clipboard (Ctrl+C)" disabled>⧉ copiar el</button>' +
     '<button id="dm-copysel" title="copiar o seletor CSS do(s) elemento(s) pro clipboard" disabled>⛓ copiar seletor</button>' +
-    '<button id="dm-copy" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
-    '<span class="dm-sep"></span>' +
-    '<button id="dm-paste" title="colar elemento(s) (Ctrl+V)" disabled>⊕ colar</button>' +
-    '<button id="dm-del" title="apagar selecionado(s) (Del)" disabled>🗑 apagar</button>' +
-    '<span class="dm-sep"></span>' +
-    '<button id="dm-undo" title="desfazer (Ctrl+Z)" disabled>↶ undo</button>' +
-    '<button id="dm-reset" title="desfazer tudo">↺ reset</button>' +
+    '<button id="dm-copy" class="dm-edit-only" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
+    '<span class="dm-sep dm-edit-only"></span>' +
+    '<button id="dm-paste" class="dm-edit-only" title="colar elemento(s) (Ctrl+V)" disabled>⊕ colar</button>' +
+    '<button id="dm-del" class="dm-edit-only" title="apagar selecionado(s) (Del)" disabled>🗑 apagar</button>' +
+    '<span class="dm-sep dm-edit-only"></span>' +
+    '<button id="dm-undo" class="dm-edit-only" title="desfazer (Ctrl+Z)" disabled>↶ undo</button>' +
+    '<button id="dm-reset" class="dm-edit-only" title="desfazer tudo">↺ reset</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-quit" title="sair — remove a ferramenta da página">✕ sair</button>' +
     '<span class="dm-cur" id="dm-cur">—</span>';
@@ -106,7 +113,8 @@
     ready(() => {
       document.head.appendChild(style);
       document.body.appendChild(bar);
-      bar.querySelector("#dm-toggle").addEventListener("click", toggle);
+      bar.querySelector("#dm-mode-select").addEventListener("click", () => setMode(mode === "select" ? "off" : "select"));
+      bar.querySelector("#dm-mode-edit").addEventListener("click", () => setMode(mode === "edit" ? "off" : "edit"));
       bar.querySelector("#dm-parent").addEventListener("click", selectParent);
       bar.querySelector("#dm-copy").addEventListener("click", copyLayout);
       bar.querySelector("#dm-copysel").addEventListener("click", copySelector);
@@ -128,28 +136,41 @@
     });
   }
 
-  function setOn(next) {
+  // MODOS: "off" (dormente) · "select" (inspecionar: só seleciona, não muta) ·
+  // "edit" (editor completo). Selecionar e copiar seletor/HTML valem nos dois modos
+  // ativos; mover/redimensionar e mutações (colar/apagar/agrupar/camadas) só no "edit".
+  function setMode(next) {
     boot();
-    const want = !!next;
-    if (want === on) return;
-    on = want;
-    document.body.classList.toggle("dm-on", on);
-    const btn = bar.querySelector("#dm-toggle");
-    if (btn) {
-      btn.textContent = on ? "✎ design: ON" : "✎ design: OFF";
-      btn.classList.toggle("on", on);
-    }
-    if (on) {
+    next = (next === "select" || next === "edit") ? next : "off";
+    if (next === mode) return;
+    const wasActive = mode !== "off";
+    mode = next;
+    const active = mode !== "off";
+    const editing = mode === "edit";
+    document.body.classList.toggle("dm-active", active);
+    document.body.classList.toggle("dm-edit", editing);
+    bar.classList.toggle("dm-editing", editing);
+    const selBtn = bar.querySelector("#dm-mode-select");
+    const editBtn = bar.querySelector("#dm-mode-edit");
+    if (selBtn) selBtn.classList.toggle("on", mode === "select");
+    if (editBtn) editBtn.classList.toggle("on", editing);
+    if (active && !wasActive) {
       document.addEventListener("pointerdown", onDown, true);
       document.addEventListener("keydown", onKey, true);
-    } else {
+    } else if (!active && wasActive) {
       document.removeEventListener("pointerdown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
+      if (drag) onUp(); // segurança: encerra qualquer drag em curso
       clearSel();
     }
+    updateCur();
   }
 
-  function toggle() { setOn(!on); }
+  function isEditing() { return mode === "edit"; }
+
+  // toggle (ícone da extensão / API): liga em modo SELETOR (seguro p/ investigar)
+  // ou desliga se já estiver ativo. Pra editar, clique "✎ editar" na barra.
+  function toggle() { setMode(mode === "off" ? "select" : "off"); }
 
   // ── MODO ESTÁTICO ──────────────────────────────────────────────────────────
   // Toggle DEDICADO (independente do design ON/OFF): congela a página — não
@@ -193,9 +214,9 @@
   // deixando a página como o usuário a editou. Permite reinstalar depois (ex.:
   // clicar o bookmarklet de novo) zerando o guard __installed.
   function quit() {
-    setOn(false); // remove listeners + dm-on + limpa seleção (se estava ON)
+    setMode("off"); // remove listeners + classes de modo + limpa seleção
     setStatic(false); // remove o bloqueio de eventos do modo estático
-    document.body.classList.remove("dm-static");
+    document.body.classList.remove("dm-active", "dm-edit", "dm-static");
     document.querySelectorAll(".dm-editable, .dm-sel, .dm-grouped")
       .forEach((n) => n.classList.remove("dm-editable", "dm-sel", "dm-grouped"));
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
@@ -208,11 +229,15 @@
   }
 
   function onKey(e) {
-    if (!on) return;
+    if (mode === "off") return;
     const mod = e.ctrlKey || e.metaKey;
+    // ── valem nos dois modos (não mutam o layout) ──
+    if (e.key === "Escape") { clearSel(); return; }
+    if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyElements(); return; }
+    // ── daqui pra baixo: só no modo editor ──
+    if (mode !== "edit") return;
     if (mod && (e.key === "g" || e.key === "G")) { e.preventDefault(); if (e.shiftKey) ungroupSelected(); else groupSelected(); }
     else if (mod && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undo(); }
-    else if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyElements(); }
     else if (mod && (e.key === "v" || e.key === "V")) { e.preventDefault(); pasteElements(); }
     else if (e.key === "]") { e.preventDefault(); layer("up"); }
     else if (e.key === "[") { e.preventDefault(); layer("down"); }
@@ -222,7 +247,6 @@
       e.preventDefault();
       deleteElements();
     }
-    else if (e.key === "Escape") { clearSel(); }
   }
 
   function isEditableTarget(node) {
@@ -619,6 +643,9 @@
     // Clique simples num elemento fora da seleção: seleciona só ele.
     if (!selected.has(el)) selectOnly(el);
 
+    // Modo SELETOR (inspecionar): só seleciona — nunca move nem redimensiona.
+    if (!isEditing()) { e.preventDefault(); e.stopPropagation(); return; }
+
     const r = el.getBoundingClientRect();
     const inCorner = e.clientX > r.right - RESIZE_CORNER && e.clientY > r.bottom - RESIZE_CORNER;
     if (inCorner) {
@@ -764,14 +791,19 @@
   // ── API pública ──
   const API = {
     __installed: true,
-    enable() { setOn(true); },
-    disable() { setOn(false); },
+    setMode(m) { setMode(m); },
+    select() { setMode("select"); },
+    edit() { setMode("edit"); },
+    enable() { setMode("edit"); },
+    disable() { setMode("off"); },
     toggle() { toggle(); },
     quit() { quit(); },
     setStatic(v) { setStatic(!!v); },
     toggleStatic() { toggleStatic(); },
     isStatic() { return staticOn; },
-    isOn() { return on; },
+    isOn() { return mode !== "off"; },
+    isEditing() { return mode === "edit"; },
+    mode() { return mode; },
   };
   window.DesignMode = API;
 
@@ -780,7 +812,7 @@
     const cur = document.currentScript ||
       [...document.querySelectorAll("script[src]")].find((s) => /design-mode\.js(\?|$)/.test(s.src));
     boot(); // sempre injeta a barra
-    if (cur && cur.hasAttribute("data-autostart")) setOn(true);
+    if (cur && cur.hasAttribute("data-autostart")) setMode("edit");
   }
   maybeAutostart();
 })();
