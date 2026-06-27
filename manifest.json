@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Design Mode",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "description": "Liga/desliga o design-mode.js na aba atual. Injeta o arquivo real do repo (sempre fresco) — sem bookmarklet, sem servidor.",
   "icons": {
     "16": "icons/icon16.png",

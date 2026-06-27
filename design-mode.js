@@ -29,6 +29,7 @@
   const SNAP = 6; // px de tolerância do alinhamento magnético no drag (Alt desliga)
   let groupSeq = 0; // contador de ids de grupo (data-dm-group)
   let guideV = null, guideH = null; // linhas-guia do snap (criadas sob demanda)
+  let snapBoxV = null, snapBoxH = null; // realce da CAIXA do elemento-alvo do snap (eixo X/Y)
   const changes = new Map(); // el -> { w, h, tx, ty, z, el, snap? }
   const baselines = new Map(); // el -> { w, h, tx, ty, z } ANTES da 1ª mutação (before do spec)
   const notes = new Map(); // el -> { types:Set<string>, text:string } (intenção em linguagem natural)
@@ -81,6 +82,8 @@
     .dm-guide{position:fixed;z-index:2147483646;background:#ff3b8d;pointer-events:none;margin:0;padding:0}
     .dm-guide.dm-guide-v{top:0;width:1px;height:100vh}
     .dm-guide.dm-guide-h{left:0;height:1px;width:100vw}
+    .dm-snapbox{position:fixed;z-index:2147483646;border:1px solid #ff3b8d;box-sizing:border-box;
+      pointer-events:none;margin:0;padding:0;border-radius:2px;background:rgba(255,59,141,.06)}
     .dm-bar #dm-note.on{border-color:#e6a23c;background:#2a2113;color:#ffd27f}
     .dm-note-pop{position:fixed;z-index:2147483647;width:264px;max-width:96vw;box-sizing:border-box;
       font:12px ui-monospace,monospace;background:#11151b;color:#cfe;border:1px solid #38414e;
@@ -273,8 +276,8 @@
     document.querySelectorAll(".dm-editable, .dm-sel, .dm-grouped")
       .forEach((n) => n.classList.remove("dm-editable", "dm-sel", "dm-grouped"));
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
-    [guideV, guideH].forEach((g) => { if (g && g.parentNode) g.parentNode.removeChild(g); });
-    guideV = guideH = null;
+    [guideV, guideH, snapBoxV, snapBoxH].forEach((g) => { if (g && g.parentNode) g.parentNode.removeChild(g); });
+    guideV = guideH = null; snapBoxV = snapBoxH = null;
     for (const [, ov] of detachOverlays) { if (ov.parentNode) ov.parentNode.removeChild(ov); }
     detachOverlays.clear();
     nudgeSession = null;
@@ -912,7 +915,7 @@
     let count = 0;
     for (const el of document.querySelectorAll("body *")) {
       if (count > 600) break;
-      if (exclude.has(el) || inBar(el) || (el.classList && el.classList.contains("dm-guide"))) continue;
+      if (exclude.has(el) || inBar(el) || (el.classList && (el.classList.contains("dm-guide") || el.classList.contains("dm-snapbox")))) continue;
       let skip = false;
       for (const x of exclude) { if (el.contains(x) || x.contains(el)) { skip = true; break; } }
       if (skip) continue;
@@ -968,6 +971,30 @@
     }
     g.style.display = "block";
     if (axis === "v") g.style.left = pos + "px"; else g.style.top = pos + "px";
+  }
+
+  // Realça a CAIXA do elemento-alvo do snap, com a borda CASADA mais grossa — assim você vê
+  // A QUEM está se alinhando (além da reta de viewport). slot "v"/"h" = alvo do eixo X/Y.
+  function showTargetBox(slot, target) {
+    let b = slot === "v" ? snapBoxV : snapBoxH;
+    if (!target || !target.el || !target.el.isConnected) { if (b) b.style.display = "none"; return; }
+    if (!b) {
+      b = document.createElement("div");
+      b.className = "dm-snapbox";
+      (document.body || document.documentElement).appendChild(b);
+      if (slot === "v") snapBoxV = b; else snapBoxH = b;
+    }
+    const r = target.el.getBoundingClientRect();
+    b.style.display = "block";
+    b.style.left = r.left + "px"; b.style.top = r.top + "px";
+    b.style.width = r.width + "px"; b.style.height = r.height + "px";
+    // engrossa SÓ a borda que está casando; centro (centerX/centerY) fica uniforme.
+    b.style.borderWidth = "1px";
+    const W = "3px";
+    if (target.edge === "left") b.style.borderLeftWidth = W;
+    else if (target.edge === "right") b.style.borderRightWidth = W;
+    else if (target.edge === "top") b.style.borderTopWidth = W;
+    else if (target.edge === "bottom") b.style.borderBottomWidth = W;
   }
 
   function onDown(e) {
@@ -1031,9 +1058,9 @@
       const ys = [a.top + dy, a.top + dy + a.height / 2, a.top + dy + a.height];
       const sx = nearestSnap(xs, drag.targetXs);
       const sy = nearestSnap(ys, drag.targetYs);
-      if (sx) { dx += sx.delta; showGuide("v", sx.pos); drag.lastSnapX = sx; } else { showGuide("v", null); drag.lastSnapX = null; }
-      if (sy) { dy += sy.delta; showGuide("h", sy.pos); drag.lastSnapY = sy; } else { showGuide("h", null); drag.lastSnapY = null; }
-    } else { showGuide("v", null); showGuide("h", null); drag.lastSnapX = null; drag.lastSnapY = null; }
+      if (sx) { dx += sx.delta; showGuide("v", sx.pos); showTargetBox("v", sx.target); drag.lastSnapX = sx; } else { showGuide("v", null); showTargetBox("v", null); drag.lastSnapX = null; }
+      if (sy) { dy += sy.delta; showGuide("h", sy.pos); showTargetBox("h", sy.target); drag.lastSnapY = sy; } else { showGuide("h", null); showTargetBox("h", null); drag.lastSnapY = null; }
+    } else { showGuide("v", null); showGuide("h", null); showTargetBox("v", null); showTargetBox("h", null); drag.lastSnapX = null; drag.lastSnapY = null; }
     for (const d of drag) { setImp(d.el, "transform", `translate(${d.btx + dx}px, ${d.bty + dy}px)`); }
     repositionNotes(); // badges 📌 acompanham os elementos arrastados
   }
@@ -1058,6 +1085,8 @@
     drag = null;
     showGuide("v", null);
     showGuide("h", null);
+    showTargetBox("v", null);
+    showTargetBox("h", null);
     repositionNotes();
     window.removeEventListener("pointermove", onMove, true);
     window.removeEventListener("pointerup", onUp, true);
@@ -1305,7 +1334,7 @@
   // data-dm* de todo nó. As edições (estilos inline de transform/width/...) permanecem.
   function serializeCleanHTML() {
     const root = document.documentElement.cloneNode(true);
-    root.querySelectorAll(".dm-bar, .dm-guide, .dm-note-pop, .dm-note-badge, .dm-detach, [data-dm-style]")
+    root.querySelectorAll(".dm-bar, .dm-guide, .dm-snapbox, .dm-note-pop, .dm-note-badge, .dm-detach, [data-dm-style]")
       .forEach((n) => n.remove());
     const all = [root, ...root.querySelectorAll("*")];
     for (const n of all) {
