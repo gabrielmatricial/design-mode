@@ -108,6 +108,12 @@ async function checkForUpdates() {
   } catch (_) { /* offline / sem rede: ignora */ }
 }
 
+// Recarrega a extensão direto do disco (Alt+Shift+D) — pega edições de
+// design-mode.js / bg.js / manifest sem precisar abrir chrome://extensions.
+chrome.commands.onCommand.addListener((cmd) => {
+  if (cmd === "reload-extension") chrome.runtime.reload();
+});
+
 chrome.runtime.onInstalled.addListener(checkForUpdates);
 chrome.runtime.onStartup.addListener(checkForUpdates);
 chrome.alarms.create("dm-update-check", { periodInMinutes: 360 });
