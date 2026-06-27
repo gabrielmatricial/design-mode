@@ -34,6 +34,7 @@
   const notes = new Map(); // el -> { types:Set<string>, text:string } (intenção em linguagem natural)
   const noteBadges = new Map(); // el -> badge overlay 📌 (NUNCA filho do alvo)
   const detachOverlays = new Map(); // el -> overlay tracejado (solto do fluxo, FORA do alvo)
+  const displayForced = new Set(); // els promovidos inline→inline-block p/ poder mover
   let notePop = null; // popover de nota aberto (1 por vez)
   // Intenções tipadas (chips) — vocabulário curto e acionável pro agente programador.
   const INTENTS = [
@@ -279,6 +280,7 @@
     nudgeSession = null;
     clearNotes(); // remove badges 📌 + popover; zera o Map de notas
     baselines.clear();
+    displayForced.clear();
     fileHandle = null; // esquece o arquivo aberto (File System Access API)
     window.removeEventListener("scroll", repositionNotes, true);
     window.removeEventListener("resize", repositionNotes, true);
@@ -530,13 +532,13 @@
       return;
     }
     for (const s of entry.snaps) {
-      s.el.style.transform = s.transform;
-      s.el.style.width = s.width;
-      s.el.style.height = s.height;
-      if (s.zIndex !== undefined) s.el.style.zIndex = s.zIndex;
-      if (s.position !== undefined) s.el.style.position = s.position;
-      if (s.top !== undefined) s.el.style.top = s.top;
-      if (s.left !== undefined) s.el.style.left = s.left;
+      setImp(s.el, "transform", s.transform);
+      setImp(s.el, "width", s.width);
+      setImp(s.el, "height", s.height);
+      if (s.zIndex !== undefined) setImp(s.el, "z-index", s.zIndex);
+      if (s.position !== undefined) setImp(s.el, "position", s.position);
+      if (s.top !== undefined) setImp(s.el, "top", s.top);
+      if (s.left !== undefined) setImp(s.el, "left", s.left);
       if (s.change) changes.set(s.el, s.change);
       else changes.delete(s.el);
     }
@@ -623,7 +625,7 @@
       const existing = (clone.style.transform || "").match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
       const ox = (existing ? parseFloat(existing[1]) : 0) + PASTE_OFFSET;
       const oy = (existing ? parseFloat(existing[2]) : 0) + PASTE_OFFSET;
-      clone.style.transform = `translate(${ox}px, ${oy}px)`;
+      setImp(clone, "transform", `translate(${ox}px, ${oy}px)`);
       if (next) parent.insertBefore(clone, next);
       else parent.appendChild(clone);
       created.push(clone);
@@ -702,7 +704,7 @@
       let tx = c.tx || 0, ty = c.ty || 0;
       if (isHAlign(kind)) tx += target - edgePos(o.r, kind);
       else ty += target - edgePos(o.r, kind);
-      o.el.style.transform = `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`;
+      setImp(o.el, "transform", `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`);
       record(o.el);
       if (keep) {
         const cc = changes.get(o.el); // record() recria o objeto → anexar a regra DEPOIS
@@ -735,7 +737,7 @@
       let tx = c.tx || 0, ty = c.ty || 0;
       if (isHAlign(kind)) tx += edgePos(rr, kind) - edgePos(er, kind);
       else ty += edgePos(rr, kind) - edgePos(er, kind);
-      el.style.transform = `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`;
+      setImp(el, "transform", `translate(${Math.round(tx)}px, ${Math.round(ty)}px)`);
       const rule = c.rule;
       record(el);
       const cc = changes.get(el);
@@ -765,7 +767,7 @@
       const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
       const tx = (m ? parseFloat(m[1]) : 0) + dx;
       const ty = (m ? parseFloat(m[2]) : 0) + dy;
-      el.style.transform = `translate(${tx}px, ${ty}px)`;
+      setImp(el, "transform", `translate(${tx}px, ${ty}px)`);
       record(el);
     }
     reapplyRules();
@@ -778,8 +780,8 @@
     let last = null;
     for (const el of els) {
       markBaseline(el);
-      if (dw) el.style.width = Math.max(8, el.offsetWidth + dw) + "px"; // clamp 8px
-      if (dh) el.style.height = Math.max(8, el.offsetHeight + dh) + "px";
+      if (dw) setImp(el, "width", Math.max(8, el.offsetWidth + dw) + "px"); // clamp 8px
+      if (dh) setImp(el, "height", Math.max(8, el.offsetHeight + dh) + "px");
       record(el);
       last = el;
     }
@@ -798,8 +800,8 @@
     pushUndo(els);
     for (const el of els) markBaseline(el);
     for (const el of els) {
-      if (back) { el.style.position = ""; el.style.top = ""; el.style.left = ""; }
-      else { el.style.position = "absolute"; el.style.top = "auto"; el.style.left = "auto"; }
+      if (back) { setImp(el, "position", ""); setImp(el, "top", ""); setImp(el, "left", ""); }
+      else { setImp(el, "position", "absolute"); setImp(el, "top", "auto"); setImp(el, "left", "auto"); }
       record(el);
       const c = changes.get(el); // record() recria o objeto → anexar struct DEPOIS
       if (c) {
@@ -851,8 +853,8 @@
   }
   function applyZ(el, z) {
     const posForced = getComputedStyle(el).position === "static";
-    if (posForced) el.style.position = "relative"; // z-index só vale em elemento posicionado
-    el.style.zIndex = String(z);
+    if (posForced) setImp(el, "position", "relative"); // z-index só vale em elemento posicionado
+    setImp(el, "z-index", String(z));
     const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
     const prev = changes.get(el) || {};
     changes.set(el, {
@@ -1006,7 +1008,7 @@
     e.stopPropagation();
     const els = [...selected];
     pushUndo(els);
-    for (const x of els) markBaseline(x); // "before" do spec, antes de mover
+    for (const x of els) { markBaseline(x); ensureMovable(x); } // before + garante movível (inline→inline-block)
     drag = els.map((x) => { const c = changes.get(x) || {}; return { el: x, btx: c.tx || 0, bty: c.ty || 0 }; });
     drag.sx = e.clientX;
     drag.sy = e.clientY;
@@ -1032,7 +1034,7 @@
       if (sx) { dx += sx.delta; showGuide("v", sx.pos); drag.lastSnapX = sx; } else { showGuide("v", null); drag.lastSnapX = null; }
       if (sy) { dy += sy.delta; showGuide("h", sy.pos); drag.lastSnapY = sy; } else { showGuide("h", null); drag.lastSnapY = null; }
     } else { showGuide("v", null); showGuide("h", null); drag.lastSnapX = null; drag.lastSnapY = null; }
-    for (const d of drag) { d.el.style.transform = `translate(${d.btx + dx}px, ${d.bty + dy}px)`; }
+    for (const d of drag) { setImp(d.el, "transform", `translate(${d.btx + dx}px, ${d.bty + dy}px)`); }
     repositionNotes(); // badges 📌 acompanham os elementos arrastados
   }
 
@@ -1095,7 +1097,25 @@
     return `${name[s.myEdge] || s.myEdge} aligned to ${s.targetSelector} (${name[s.targetEdge] || s.targetEdge})`;
   }
 
+  // Aplica um estilo no elemento-alvo com prioridade !important — vence o CSS da página
+  // mesmo quando ela usa !important (caso real: páginas com `transform: ... !important`
+  // que anulavam o mover/arrastar). Valor "" remove a propriedade. Nomes em dash-case.
+  function setImp(el, prop, val) {
+    if (val === "" || val == null) el.style.removeProperty(prop);
+    else el.style.setProperty(prop, String(val), "important");
+  }
+
+  // transform/width não têm efeito em elemento display:inline — promove a inline-block (o
+  // mínimo pra mover/redimensionar). Marca em displayForced p/ exportar e limpar depois.
+  function ensureMovable(el) {
+    if (displayForced.has(el)) return;
+    try {
+      if (getComputedStyle(el).display === "inline") { setImp(el, "display", "inline-block"); displayForced.add(el); }
+    } catch (_) {}
+  }
+
   function record(el) {
+    ensureMovable(el);
     const prev = changes.get(el) || {};
     const m = el.style.transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)px\s*,\s*(-?\d+(?:\.\d+)?)px/);
     const c = {
@@ -1249,6 +1269,7 @@
       if (!c.el.isConnected) continue; // ignora nós já removidos
       const decls = [`  width: ${c.w}px;`, `  height: ${c.h}px;`];
       if (c.tx || c.ty) decls.push(`  transform: translate(${c.tx}px, ${c.ty}px);`);
+      if (displayForced.has(c.el)) decls.push(`  display: inline-block;`); // era inline → precisa disso pro transform pegar
       const detached = c.struct && c.struct.kind === "detach";
       if (detached) decls.push(`  position: ${c.struct.position};`);
       if (c.z != null) {
@@ -1341,15 +1362,18 @@
     if (changes.size) pushUndo([...changes.keys()]); // reset também é desfazível
     for (const c of changes.values()) {
       if (!c.el.isConnected) continue;
-      c.el.style.transform = "";
-      c.el.style.width = "";
-      c.el.style.height = "";
-      c.el.style.zIndex = "";
-      if (c.posForced) c.el.style.position = "";
+      setImp(c.el, "transform", "");
+      setImp(c.el, "width", "");
+      setImp(c.el, "height", "");
+      setImp(c.el, "z-index", "");
+      if (c.posForced) setImp(c.el, "position", "");
+      if (c.struct) { setImp(c.el, "position", ""); setImp(c.el, "top", ""); setImp(c.el, "left", ""); }
+      if (displayForced.has(c.el)) setImp(c.el, "display", "");
       c.el.classList.remove("dm-editable", "dm-sel");
     }
     changes.clear();
     baselines.clear(); // zera os "before" do spec junto com as edições
+    displayForced.clear();
     document.querySelectorAll("[data-dm-group]").forEach((n) => {
       n.removeAttribute("data-dm-group");
       n.classList.remove("dm-grouped");
@@ -1508,6 +1532,7 @@
       };
       const constraint = (c && ruleConstraint(c)) || (c && c.snap ? snapToConstraint(c.snap) : null);
       if (constraint) entry.constraint = constraint;
+      if (displayForced.has(el)) entry.displayForced = true;
       if (c && c.struct && c.struct.kind === "detach") {
         entry.struct = { kind: "detach", position: c.struct.position, parent: c.struct.parent };
       }
