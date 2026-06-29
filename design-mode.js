@@ -9,22 +9,28 @@
  * undo (Ctrl+Z), copy/paste elements (Ctrl+C / Ctrl+V), delete (Del),
  * export CSS ("copiar layout"), quit (✕ — removes the tool from the page).
  *
- * Two active modes: SELECT (🔍 inspecionar) only selects/inspects elements —
- * never moves or resizes them, safe for investigating; EDIT (✎ editar) is the
- * full editor (move/resize/align/group/copy/paste/delete). Pair with STATIC
+ * Two active modes: SELECT (🔍 inspecionar) — with the default MOVE tool it never
+ * moves/resizes/restructures the layout, safe for investigating; EDIT (✎ editar) is
+ * the full editor (move/resize/align/group/copy/paste/delete). Pair with STATIC
  * (▣ estático) to freeze the page's own clicks/dropdowns/forms.
  *
+ * Pointer TOOL (orthogonal to the mode — works in BOTH inspecionar and editar):
+ * MOVE (✥) drags to move (move/resize only mutate in editar); MARQUEE (▦ seleção)
+ * drags a rubber-band to multi-select everything it touches (read-only, both modes);
+ * TEXT (T) clicks an element to edit its text in place (a deliberate content edit,
+ * available in both modes). Shortcuts: V / M / T.
+ *
  * Public API: window.DesignMode.select() / .edit() / .setMode("off"|"select"|"edit")
- *   / .toggle() / .quit() / .isEditing() / .mode()
+ *   / .setTool("move"|"marquee"|"text") / .tool() / .toggle() / .quit() / .isEditing() / .mode()
  *
  * MIT License.
  */
-(function () {
+(function DM_INSTALL() {
   "use strict";
 
   if (window.DesignMode && window.DesignMode.__installed) return;
 
-  const RESIZE_CORNER = 20; // px do canto ↘ reservados pro resize nativo
+  const DM_VERSION = "1.8.0"; // versão da ferramenta — mostrada na barra pra confirmar que atualizou
   const PASTE_OFFSET = 12; // px de offset ao colar
   const SNAP = 6; // px de tolerância do alinhamento magnético no drag (Alt desliga)
   let groupSeq = 0; // contador de ids de grupo (data-dm-group)
@@ -36,6 +42,7 @@
   const noteBadges = new Map(); // el -> badge overlay 📌 (NUNCA filho do alvo)
   const detachOverlays = new Map(); // el -> overlay tracejado (solto do fluxo, FORA do alvo)
   const displayForced = new Set(); // els promovidos inline→inline-block p/ poder mover
+  const boxSizingForced = new Set(); // els forçados a box-sizing:border-box p/ o resize bater 1:1
   let notePop = null; // popover de nota aberto (1 por vez)
   // Intenções tipadas (chips) — vocabulário curto e acionável pro agente programador.
   const INTENTS = [
@@ -53,8 +60,21 @@
   let mode = "off"; // "off" (dormente) | "select" (inspecionar) | "edit" (editor)
   let drag = null; // array de { el, btx, bty } (+ .sx/.sy) — move todos juntos
   let booted = false;
+  let dmQuit = false; // marca que o usuário saiu (✕) — barra-moldura não reinjeta no iframe
+  let frameObserver = null, frameSweep = null, frameKick = null, dmMsgHandler = null; // observação/sweep/escuta de iframes filhos
+  const dmWatched = new Map(); // iframe -> handler de 'load' (guardado p/ remover no quit, sem vazar)
   let nudgeSession = null; // { els:Set, t:number } — coalesce de undo p/ rajadas de seta (mover/resize teclado)
   let alignKeep = true; // '@ manter': align vincula ao último selecionado (constraint mantida)
+  // ── FERRAMENTA de ponteiro (eixo ORTOGONAL a inspecionar/editar) ──
+  // "move" (padrão): arrastar move (editar) / só clica-seleciona (inspecionar); grip ↘ redimensiona.
+  // "marquee": arrastar desenha um retângulo e seleciona tudo que ENCOSTAR (vale nos dois modos).
+  // "text": clicar edita o texto do elemento no lugar (contenteditable).
+  let tool = "move";
+  let marquee = null; // { x0,y0,x1,y1, add, cands:[{el,r}], hi:Set, box } durante o retângulo
+  let textEdit = null; // { el, before } enquanto edita o texto no lugar
+  const textEdits = new Map(); // el -> { before, after } (innerHTML) p/ spec + contador
+  let resize = null; // { sx,sy, anchor, anchorRect0, base:Map<el,{w,h}>, targetXs, targetYs, snapX, snapY }
+  let rzHandle = null; // overlay do grip de resize (↘) — afeta TODOS os selecionados
 
   const style = document.createElement("style");
   style.setAttribute("data-dm-style", ""); // marcador p/ remover do HTML salvo
@@ -62,6 +82,10 @@
     .dm-bar{position:fixed;z-index:2147483647;right:12px;bottom:12px;display:flex;gap:5px;
       align-items:center;font:12px ui-monospace,monospace;background:#11151b;color:#cfe;flex-wrap:wrap;max-width:96vw;
       border:1px solid #38414e;border-radius:8px;padding:6px 8px;box-shadow:0 4px 16px #0008}
+    .dm-bar.dm-bar-frame{left:12px;right:auto;border-color:#e6a23c}
+    .dm-bar.dm-dragged{right:auto;bottom:auto}
+    .dm-bar #dm-grip{cursor:grab;user-select:none;padding:0 4px;color:#7f93a6;font-size:14px;line-height:1;touch-action:none}
+    .dm-bar.dm-dragging #dm-grip{cursor:grabbing}
     .dm-bar button{font:12px ui-monospace,monospace;padding:6px 8px;background:#1b222c;color:#cfe;
       border:1px solid #38414e;border-radius:6px;cursor:pointer}
     .dm-bar button:hover{border-color:#5b8;background:#1f2a36}
@@ -73,10 +97,19 @@
     .dm-bar .dm-grp1{display:none;gap:4px}
     .dm-bar.dm-has-sel .dm-grp1{display:flex}
     .dm-bar .dm-cur{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8aa}
+    .dm-bar .dm-ver{color:#5f7287;font-size:10px;align-self:center;margin-left:2px;opacity:.8}
+    .dm-bar.dm-collapsed{padding:4px 8px}
+    .dm-bar.dm-collapsed > *:not(.dm-bar-toggle){display:none !important}
+    .dm-bar .dm-bar-toggle{cursor:pointer;font-weight:bold;align-self:center;color:#9fc6ff;touch-action:none;user-select:none}
+    .dm-bar.dm-bar-frame .dm-bar-toggle{color:#e6a23c}
+    .dm-bar.dm-collapsed .dm-bar-toggle::after{content:" ▸";opacity:.7}
+    .dm-bar:not(.dm-collapsed) .dm-bar-toggle::after{content:" ▾";opacity:.7}
     body.dm-active *:hover{outline:1px dashed #5b8a !important}
     .dm-sel{outline:2px solid #1dc077 !important;outline-offset:1px}
     .dm-grouped{outline:1px dashed #c9a227 !important;outline-offset:1px}
-    body.dm-edit .dm-editable{resize:both;overflow:auto}
+    .dm-rzh{position:fixed;z-index:2147483646;width:14px;height:14px;box-sizing:border-box;
+      background:#1dc077;border:2px solid #0b3a26;border-radius:3px;cursor:nwse-resize;
+      box-shadow:0 1px 4px #0008;touch-action:none;display:none}
     .dm-bar:not(.dm-editing) .dm-edit-only{display:none !important}
     .dm-bar #dm-mode-select.on{border-color:#4aa3ff;background:#0f1f2e;color:#9fd0ff}
     .dm-guide{position:fixed;z-index:2147483646;background:#ff3b8d;pointer-events:none;margin:0;padding:0}
@@ -101,13 +134,41 @@
     .dm-detach{position:fixed;z-index:2147483645;border:1px dashed #e6883c;pointer-events:none;
       box-sizing:border-box;margin:0;padding:0;border-radius:2px}
     .dm-bar #dm-keep.on{border-color:#e6a23c;background:#2a2113;color:#ffd27f}
+    /* ── ferramentas: seleção (marquee) + texto ── */
+    .dm-bar .dm-grp-tool{display:flex;gap:4px}
+    .dm-bar:not(.dm-on) .dm-tool-only{display:none !important}
+    .dm-bar #dm-tool-marquee.on{border-color:#4aa3ff;background:#0f1f2e;color:#9fd0ff}
+    .dm-bar #dm-tool-text.on{border-color:#e6a23c;background:#2a2113;color:#ffd27f}
+    .dm-marquee{position:fixed;z-index:2147483646;border:1px solid #4aa3ff;
+      background:rgba(74,163,255,.12);box-sizing:border-box;pointer-events:none;margin:0;padding:0}
+    .dm-marquee-hit{outline:2px solid #4aa3ff !important;outline-offset:1px}
+    .dm-text-editing{outline:2px dashed #e6a23c !important;outline-offset:2px}
+    body.dm-tool-marquee.dm-active *{cursor:crosshair !important;user-select:none !important}
+    body.dm-tool-text.dm-active *{cursor:text !important}
+    body.dm-active .dm-bar, body.dm-active .dm-bar *{cursor:auto !important;user-select:none !important}
+    body.dm-active .dm-bar button{cursor:pointer !important}
+    body.dm-active .dm-bar #dm-grip{cursor:grab !important}
+    body.dm-active .dm-bar #dm-toggle{cursor:pointer !important}
+    /* o popover de nota NÃO está dentro da barra: isenta do cursor de ferramenta */
+    body.dm-active .dm-note-pop, body.dm-active .dm-note-pop *{cursor:auto !important;user-select:auto !important}
+    body.dm-active .dm-note-pop textarea{cursor:text !important}
+    /* o grip ↘ não deve receber o outline tracejado de hover da página */
+    body.dm-active .dm-rzh, body.dm-active .dm-rzh:hover{outline:none !important;cursor:nwse-resize !important}
   `;
 
   const bar = document.createElement("div");
   bar.className = "dm-bar";
   bar.innerHTML =
+    '<span id="dm-toggle" class="dm-bar-toggle" title="clique pra abrir/fechar · arraste pra mover">▣ design</span>' +
+    '<span id="dm-grip" title="arraste pra mover esta barra">⠿</span>' +
     '<button id="dm-mode-select" title="modo seletor — só inspeciona/seleciona; NÃO move nem redimensiona (seguro pra investigar)">🔍 inspecionar</button>' +
     '<button id="dm-mode-edit" title="modo editor — mover, redimensionar, alinhar, agrupar, copiar/colar, apagar">✎ editar</button>' +
+    '<span class="dm-sep dm-tool-only"></span>' +
+    '<span class="dm-grp-tool dm-tool-only" id="dm-tools">' +
+      '<button id="dm-tool-move" class="on" title="ferramenta MOVER (V) — arrastar move o(s) elemento(s); o grip ↘ redimensiona TODOS os selecionados (segure Shift pra alinhar)">✥ mover</button>' +
+      '<button id="dm-tool-marquee" title="ferramenta SELEÇÃO (M) — arraste pra desenhar um retângulo; tudo que encostar entra na seleção. Vale em inspecionar E editar">▦ seleção</button>' +
+      '<button id="dm-tool-text" title="ferramenta TEXTO (T) — clique num elemento pra editar o texto no lugar (Enter confirma · Esc cancela)">T texto</button>' +
+    '</span>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-static" title="modo estático — congela a página: não responde a cliques, dropdowns nem filtros">▣ estático: OFF</button>' +
     '<button id="dm-parent" title="selecionar elemento pai (Alt+↑) — Alt+↓ filho, Alt+←/→ irmãos">⬆ pai</button>' +
@@ -135,6 +196,7 @@
     '<button id="dm-copy" class="dm-edit-only" title="copiar CSS do layout (tamanhos/posição) pro clipboard">📋 copiar layout</button>' +
     '<button id="dm-copyspec" title="copiar SPEC (geometria + intenção) em Markdown + JSON pro agente programador">🧾 copiar spec</button>' +
     '<button id="dm-copynotes" title="copiar só as notas/intenções (Markdown + JSON)">🗒 copiar notas</button>' +
+    '<button id="dm-copyall" title="copiar TUDO num pacote só: spec (intenção+geometria+notas) + layout CSS + seletores + HTML">📦 copiar tudo</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-save" title="salvar o HTML da página no arquivo (Ctrl+S) — sobrescreve em localhost/https, baixa cópia em file://">💾 salvar</button>' +
     '<button id="dm-saveas" title="salvar como… — escolher arquivo/destino (Ctrl+Shift+S)">💾 salvar como…</button>' +
@@ -146,11 +208,54 @@
     '<button id="dm-reset" class="dm-edit-only" title="desfazer tudo">↺ reset</button>' +
     '<span class="dm-sep"></span>' +
     '<button id="dm-quit" title="sair — remove a ferramenta da página">✕ sair</button>' +
-    '<span class="dm-cur" id="dm-cur">—</span>';
+    '<span class="dm-cur" id="dm-cur">—</span>' +
+    '<span class="dm-ver" id="dm-ver" title="versão da ferramenta — confira se mudou após recarregar (Alt+Shift+D)">v' + DM_VERSION + '</span>';
 
   function ready(fn) {
     if (document.body) fn();
     else document.addEventListener("DOMContentLoaded", fn);
+  }
+
+  function makeDraggable(el, handle, onTap) {
+    if (!handle) return;
+    let dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    const onDown = (e) => {
+      dragging = true; moved = false;
+      const r = el.getBoundingClientRect();
+      // fixa em left/top a partir da posição atual (independe de right/bottom)
+      ox = r.left; oy = r.top;
+      sx = e.clientX; sy = e.clientY;
+      try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+      e.preventDefault();
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      if (!moved && Math.abs(dx) + Math.abs(dy) < 4) return; // ainda é clique, não arrasto
+      if (!moved) { // primeiro movimento real: fixa em left/top
+        moved = true;
+        el.classList.add("dm-dragged", "dm-dragging");
+        el.style.left = ox + "px";
+        el.style.top = oy + "px";
+      }
+      let nx = ox + dx, ny = oy + dy;
+      const r = el.getBoundingClientRect();
+      nx = Math.min(Math.max(0, nx), Math.max(0, innerWidth - r.width));
+      ny = Math.min(Math.max(0, ny), Math.max(0, innerHeight - r.height));
+      el.style.left = nx + "px";
+      el.style.top = ny + "px";
+    };
+    const onUp = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      el.classList.remove("dm-dragging");
+      try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (!moved && typeof onTap === "function") onTap(e); // clique sem arrasto = toggle
+    };
+    handle.addEventListener("pointerdown", onDown);
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
   }
 
   function boot() {
@@ -159,14 +264,21 @@
     ready(() => {
       document.head.appendChild(style);
       document.body.appendChild(bar);
+      makeDraggable(bar, bar.querySelector("#dm-grip"));
+      makeDraggable(bar, bar.querySelector("#dm-toggle"), () => bar.classList.toggle("dm-collapsed"));
+      bar.classList.add("dm-collapsed"); // nasce recolhida — só a pílula; clica/arrasta
       bar.querySelector("#dm-mode-select").addEventListener("click", () => setMode(mode === "select" ? "off" : "select"));
       bar.querySelector("#dm-mode-edit").addEventListener("click", () => setMode(mode === "edit" ? "off" : "edit"));
+      bar.querySelector("#dm-tool-move").addEventListener("click", () => setTool("move"));
+      bar.querySelector("#dm-tool-marquee").addEventListener("click", () => setTool("marquee"));
+      bar.querySelector("#dm-tool-text").addEventListener("click", () => setTool("text"));
       bar.querySelector("#dm-parent").addEventListener("click", selectParent);
       bar.querySelector("#dm-copy").addEventListener("click", copyLayout);
       bar.querySelector("#dm-copysel").addEventListener("click", copySelector);
       bar.querySelector("#dm-note").addEventListener("click", () => { if (selected.size === 1) openNote([...selected][0]); });
       bar.querySelector("#dm-copyspec").addEventListener("click", copySpec);
       bar.querySelector("#dm-copynotes").addEventListener("click", copyNotes);
+      bar.querySelector("#dm-copyall").addEventListener("click", copyAll);
       bar.querySelector("#dm-save").addEventListener("click", () => saveFile(false));
       bar.querySelector("#dm-saveas").addEventListener("click", () => saveFile(true));
       bar.querySelector("#dm-reset").addEventListener("click", resetAll);
@@ -205,6 +317,7 @@
     document.body.classList.toggle("dm-active", active);
     document.body.classList.toggle("dm-edit", editing);
     bar.classList.toggle("dm-editing", editing);
+    bar.classList.toggle("dm-on", active); // mostra a paleta de ferramentas (✥/▦/T) quando ativo
     const selBtn = bar.querySelector("#dm-mode-select");
     const editBtn = bar.querySelector("#dm-mode-edit");
     if (selBtn) selBtn.classList.toggle("on", mode === "select");
@@ -216,6 +329,9 @@
       document.removeEventListener("pointerdown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
       if (drag) onUp(); // segurança: encerra qualquer drag em curso
+      if (marquee) cancelMarquee(); // encerra um retângulo em curso
+      if (resize) onRzUp(); // encerra um resize em curso
+      if (textEdit) endTextEdit(true); // confirma uma edição de texto em curso
       clearSel();
       clearNotes(); // setMode("off") limpa o Map de notas + overlays
     }
@@ -228,13 +344,33 @@
   // ou desliga se já estiver ativo. Pra editar, clique "✎ editar" na barra.
   function toggle() { setMode(mode === "off" ? "select" : "off"); }
 
+  // ── FERRAMENTA de ponteiro: "move" | "marquee" | "text" (ortogonal ao modo) ──
+  // Vale tanto em inspecionar quanto em editar. Trocar de ferramenta encerra com
+  // segurança qualquer interação em curso da ferramenta anterior.
+  function setTool(next) {
+    boot();
+    next = (next === "marquee" || next === "text") ? next : "move";
+    if (next === tool) return;
+    if (resize) onRzUp(); // encerra um resize em curso (o grip some fora da ferramenta "move")
+    if (tool === "text") endTextEdit(true); // sai do texto confirmando
+    if (tool === "marquee" && marquee) cancelMarquee();
+    tool = next;
+    for (const [id, t] of [["dm-tool-move", "move"], ["dm-tool-marquee", "marquee"], ["dm-tool-text", "text"]]) {
+      const b = bar.querySelector("#" + id);
+      if (b) b.classList.toggle("on", tool === t);
+    }
+    document.body.classList.toggle("dm-tool-marquee", tool === "marquee");
+    document.body.classList.toggle("dm-tool-text", tool === "text");
+    updateCur(); // reposiciona o grip de resize (some fora da ferramenta "move")
+  }
+
   // ── MODO ESTÁTICO ──────────────────────────────────────────────────────────
   // Toggle DEDICADO (independente do design ON/OFF): congela a página — não
   // responde a cliques, links, botões, dropdowns nem filtros. A barra é exceção.
   // Bloqueia em CAPTURA: a família click/change/submit sempre; e `mousedown` só em
   // controles interativos (assim o `<select>`, que abre no mousedown, não abre, e o
   // foco não vai pro campo) — `pointerdown` fica LIVRE pro design selecionar/arrastar
-  // e o resize nativo (↘) em elementos de layout segue funcionando.
+  // e o grip de resize (↘) segue funcionando (ele é um div, não um controle).
   let staticOn = false;
   const STATIC_BLOCK_EVENTS = ["click", "dblclick", "auxclick", "contextmenu", "submit", "change", "input", "beforeinput"];
   const STATIC_CTRL_SEL =
@@ -242,9 +378,10 @@
     '[role="button"],[role="tab"],[role="option"],[role="menuitem"],[role="combobox"],[contenteditable]';
   function onStaticBlock(e) {
     if (inBar(e.target) || inNotePop(e.target)) return; // barra e popover de nota são exceção
+    if (textEdit && textEdit.el && textEdit.el.contains(e.target)) return; // deixa digitar no texto em edição
     if (e.type === "mousedown") {
       const ctrl = e.target && e.target.closest ? e.target.closest(STATIC_CTRL_SEL) : null;
-      if (!ctrl) return; // mousedown em layout puro passa (resize nativo / drag do design)
+      if (!ctrl) return; // mousedown em layout puro passa (drag do design / grip de resize)
     }
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -272,24 +409,38 @@
   function quit() {
     setMode("off"); // remove listeners + classes de modo + limpa seleção
     setStatic(false); // remove o bloqueio de eventos do modo estático
-    document.body.classList.remove("dm-active", "dm-edit", "dm-static");
-    document.querySelectorAll(".dm-editable, .dm-sel, .dm-grouped")
-      .forEach((n) => n.classList.remove("dm-editable", "dm-sel", "dm-grouped"));
+    document.body.classList.remove("dm-active", "dm-edit", "dm-static", "dm-tool-marquee", "dm-tool-text");
+    document.querySelectorAll(".dm-editable, .dm-sel, .dm-grouped, .dm-marquee-hit, .dm-text-editing")
+      .forEach((n) => n.classList.remove("dm-editable", "dm-sel", "dm-grouped", "dm-marquee-hit", "dm-text-editing"));
     document.querySelectorAll("[data-dm-group]").forEach((n) => n.removeAttribute("data-dm-group"));
     [guideV, guideH, snapBoxV, snapBoxH].forEach((g) => { if (g && g.parentNode) g.parentNode.removeChild(g); });
     guideV = guideH = null; snapBoxV = snapBoxH = null;
     for (const [, ov] of detachOverlays) { if (ov.parentNode) ov.parentNode.removeChild(ov); }
     detachOverlays.clear();
+    if (rzHandle && rzHandle.parentNode) rzHandle.parentNode.removeChild(rzHandle);
+    rzHandle = null;
+    if (marquee && marquee.box && marquee.box.parentNode) marquee.box.parentNode.removeChild(marquee.box);
+    marquee = null;
+    textEdits.clear();
     nudgeSession = null;
     clearNotes(); // remove badges 📌 + popover; zera o Map de notas
     baselines.clear();
     displayForced.clear();
+    boxSizingForced.clear();
     fileHandle = null; // esquece o arquivo aberto (File System Access API)
     window.removeEventListener("scroll", repositionNotes, true);
     window.removeEventListener("resize", repositionNotes, true);
     if (bar.parentNode) bar.parentNode.removeChild(bar);
     if (style.parentNode) style.parentNode.removeChild(style);
     booted = false;
+    dmQuit = true;
+    if (frameObserver) { try { frameObserver.disconnect(); } catch (_) {} frameObserver = null; }
+    if (frameSweep) { clearInterval(frameSweep); frameSweep = null; }
+    if (frameKick) { clearTimeout(frameKick); frameKick = null; }
+    if (dmMsgHandler) { try { window.removeEventListener("message", dmMsgHandler); } catch (_) {} dmMsgHandler = null; }
+    for (const [frm, onLoad] of dmWatched) { try { frm.removeEventListener("load", onLoad); } catch (_) {} }
+    dmWatched.clear();
+    quitChildren(); // página-moldura: ✕ aqui também fecha o design-mode do(s) iframe(s)
     try { delete window.DesignMode; } catch (_) { window.DesignMode = undefined; }
   }
 
@@ -298,12 +449,19 @@
     // o popover de nota trata as próprias teclas (Enter/Esc/digitação) — não intercepta
     if (notePop && notePop.pop.contains(e.target)) return;
     const mod = e.ctrlKey || e.metaKey;
+    // Salvar (Ctrl+S) / Salvar como (Ctrl+Shift+S) — vale ATÉ durante a edição de texto
+    // (confirma a edição antes); bloqueia o diálogo nativo "salvar página" do navegador.
+    if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); if (textEdit) endTextEdit(true); saveFile(e.shiftKey); return; }
+    // editando texto no lugar: o contenteditable + onTextKey cuidam do resto (Enter/Esc/digitação).
+    // Sai aqui pra os atalhos globais (Del apaga elemento, setas movem) NÃO agirem enquanto digita.
+    if (textEdit) return;
     // ── valem nos dois modos (não mutam o layout) ──
     if (e.key === "Escape") { clearSel(); return; }
     if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyElements(); return; }
-    // Salvar (Ctrl+S) / Salvar como (Ctrl+Shift+S) — vale nos dois modos; bloqueia o
-    // diálogo nativo "salvar página" do navegador.
-    if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); saveFile(e.shiftKey); return; }
+    // Trocar de FERRAMENTA por tecla: V mover · M seleção (marquee) · T texto. Vale nos dois modos.
+    if (!mod && (e.key === "v" || e.key === "V")) { if (isEditableTarget(e.target)) return; e.preventDefault(); setTool("move"); return; }
+    if (!mod && (e.key === "m" || e.key === "M")) { if (isEditableTarget(e.target)) return; e.preventDefault(); setTool("marquee"); return; }
+    if (!mod && (e.key === "t" || e.key === "T")) { if (isEditableTarget(e.target)) return; e.preventDefault(); setTool("text"); return; }
     // Nota (intenção): 'N' com exatamente 1 selecionado — vale em select e edit.
     if (!mod && (e.key === "n" || e.key === "N")) {
       if (isEditableTarget(e.target)) return; // só barra campo de texto; foco na barra NÃO bloqueia
@@ -376,6 +534,15 @@
     return node && bar.contains(node);
   }
 
+  // Overlays/artefatos da PRÓPRIA ferramenta — NUNCA são alvos válidos de snap/marquee.
+  // ATENÇÃO: não inclui dm-sel/dm-editable/dm-grouped — essas vivem em elementos REAIS da
+  // página (e o dm-editable fica "grudado" depois de selecionar), então excluí-las quebraria
+  // o snap/seleção contra elementos já tocados.
+  const DM_OVERLAY_CLASSES = ["dm-guide", "dm-snapbox", "dm-marquee", "dm-rzh", "dm-note-badge", "dm-note-pop", "dm-detach"];
+  function isDmOverlay(node) {
+    return !!(node && node.classList && DM_OVERLAY_CLASSES.some((k) => node.classList.contains(k)));
+  }
+
   // ── seleção múltipla (clique = só este; Shift+clique = alterna no conjunto) ──
   // Grupos: selecionar 1 membro seleciona o grupo inteiro (data-dm-group).
   function groupMembers(el) {
@@ -411,14 +578,15 @@
     if (el.parentElement && el.parentElement !== document.body) selectOnly(el.parentElement);
   }
 
-  // Filhos-elemento "navegáveis": pula nós dm-* (barra/guias/badges/overlays) e os sem
-  // caixa (display:none / 0×0). offsetParent==null cobre o caso normal; o rect cobre
-  // position:fixed e file:// onde offsetParent pode mentir.
+  // Filhos-elemento "navegáveis": pula a barra e os overlays da ferramenta, e os sem
+  // caixa (display:none / 0×0). NÃO usa o prefixo "dm-" cru: dm-sel/dm-editable/dm-grouped
+  // ficam em elementos REAIS da página (dm-editable é grudento) e precisam continuar
+  // navegáveis. offsetParent==null cobre o caso normal; o rect cobre position:fixed e file://.
   function elementChildrenOf(el) {
     if (!el || !el.children) return [];
     return [...el.children].filter((c) => {
       if (c.nodeType !== 1) return false;
-      if (c.classList && [...c.classList].some((k) => k.indexOf("dm-") === 0)) return false;
+      if (inBar(c) || isDmOverlay(c)) return false;
       if (c.offsetParent != null) return true;
       const r = c.getBoundingClientRect();
       return r.width > 0 || r.height > 0;
@@ -467,11 +635,15 @@
     if (noteEl) { noteEl.disabled = n !== 1; noteEl.classList.toggle("on", n === 1 && notes.has([...selected][0])); }
     if (copyNotesEl) copyNotesEl.disabled = notes.size === 0;
     syncDetachOverlays(); // overlays tracejados acompanham o estado de detach (e o undo)
+    positionRzHandle(); // grip ↘ segue a seleção (some fora de editar/ferramenta move)
     const cur = bar.querySelector("#dm-cur");
     if (!cur) return;
-    // contador combinado: edições geométricas + notas de intenção
+    // contador combinado: edições geométricas + notas de intenção + textos editados.
+    // textos conta só os ainda CONECTADOS (apagar o elemento zera o item; undo o restaura).
     const meta = [];
+    let nTexto = 0; for (const el of textEdits.keys()) if (el.isConnected) nTexto++;
     if (changes.size) meta.push(changes.size + " edit" + (changes.size > 1 ? "s" : ""));
+    if (nTexto) meta.push(nTexto + " texto" + (nTexto > 1 ? "s" : ""));
     if (notes.size) meta.push(notes.size + " nota" + (notes.size > 1 ? "s" : ""));
     const metaStr = meta.length ? "  (" + meta.join(" · ") + ")" : "";
     if (n === 0) cur.textContent = meta.length ? meta.join(" · ") : "—";
@@ -513,6 +685,15 @@
   function undo() {
     const entry = undoStack.pop();
     if (!entry) { uiNotifySafe("Nada pra desfazer.", "warn"); return; }
+    if (entry.kind === "text") {
+      // desfaz a edição de texto: volta o innerHTML pro estado anterior
+      if (entry.el && entry.el.isConnected) entry.el.innerHTML = entry.before;
+      const te = textEdits.get(entry.el);
+      if (te) { if (te.before === entry.before) textEdits.delete(entry.el); else te.after = entry.before; }
+      else if (entry.restore) textEdits.set(entry.el, { before: entry.restore.before, after: entry.restore.after }); // undo de um reset re-rastreia
+      updateCur();
+      return;
+    }
     if (entry.kind === "dom") {
       // desfaz de trás pra frente
       for (let i = entry.ops.length - 1; i >= 0; i--) {
@@ -783,8 +964,10 @@
     let last = null;
     for (const el of els) {
       markBaseline(el);
-      if (dw) setImp(el, "width", Math.max(8, el.offsetWidth + dw) + "px"); // clamp 8px
-      if (dh) setImp(el, "height", Math.max(8, el.offsetHeight + dh) + "px");
+      const w0 = el.offsetWidth, h0 = el.offsetHeight; // mede ANTES de forçar border-box
+      ensureBorderBox(el);
+      if (dw) setImp(el, "width", Math.max(8, w0 + dw) + "px"); // clamp 8px
+      if (dh) setImp(el, "height", Math.max(8, h0 + dh) + "px");
       record(el);
       last = el;
     }
@@ -908,14 +1091,14 @@
     updateCur();
   }
 
-  // ── snap (alinhamento magnético no drag): coleta as linhas-alvo (bordas+centros) ──
-  function buildSnapTargets(exclude) {
-    drag.targetXs = [];
-    drag.targetYs = [];
+  // ── snap (alinhamento magnético): coleta as linhas-alvo (bordas+centros) ──
+  // Helper COMPARTILHADO por drag (mover) e resize. Empilha alvos {pos, el, edge} nos
+  // arrays xs/ys passados; pula a própria seleção, a barra e os overlays da ferramenta.
+  function edgeTargets(exclude, xs, ys) {
     let count = 0;
     for (const el of document.querySelectorAll("body *")) {
       if (count > 600) break;
-      if (exclude.has(el) || inBar(el) || (el.classList && (el.classList.contains("dm-guide") || el.classList.contains("dm-snapbox")))) continue;
+      if (exclude.has(el) || inBar(el) || isDmOverlay(el)) continue;
       let skip = false;
       for (const x of exclude) { if (el.contains(x) || x.contains(el)) { skip = true; break; } }
       if (skip) continue;
@@ -925,15 +1108,20 @@
       count++;
       // alvos como OBJETOS {pos, el, edge}: guardam a IDENTIDADE da linha (de quem é,
       // qual borda) sem materializar selector (caro) — isso só acontece no vencedor, no onUp.
-      drag.targetXs.push(
+      xs.push(
         { pos: r.left, el, edge: "left" },
         { pos: r.left + r.width / 2, el, edge: "centerX" },
         { pos: r.right, el, edge: "right" });
-      drag.targetYs.push(
+      ys.push(
         { pos: r.top, el, edge: "top" },
         { pos: r.top + r.height / 2, el, edge: "centerY" },
         { pos: r.bottom, el, edge: "bottom" });
     }
+  }
+  function buildSnapTargets(exclude) {
+    drag.targetXs = [];
+    drag.targetYs = [];
+    edgeTargets(exclude, drag.targetXs, drag.targetYs);
     // Centro do elemento PAI do arrastado: permite centralizar o objeto DENTRO do pai
     // (eixo horizontal E vertical). O pai é ancestral, então o loop acima o pula
     // (x.contains(el)); por isso o centro dele só vira alvo de snap aqui, explicitamente.
@@ -1005,6 +1193,29 @@
       closeNote(true); // clicou fora: salva e fecha — não seleciona/arrasta nesse clique
       return;
     }
+    if (rzHandle && e.target === rzHandle) return; // o grip de resize tem handler próprio (onRzDown)
+
+    // FERRAMENTA TEXTO: clicar edita o texto do elemento no lugar (não seleciona nem arrasta).
+    if (tool === "text") {
+      if (e.button) return; // só botão principal; right/middle → menu nativo
+      const t = e.target.closest("*");
+      if (textEdit && textEdit.el && textEdit.el.contains(e.target)) return; // já editando este → deixa o cursor andar
+      if (textEdit) endTextEdit(true); // clicou fora → confirma a edição anterior
+      if (t && t !== document.body && t !== document.documentElement && !inBar(t)) {
+        e.stopPropagation();
+        startTextEdit(t);
+      }
+      return;
+    }
+    // FERRAMENTA SELEÇÃO (marquee): arrastar desenha o retângulo (vale em inspecionar E editar).
+    if (tool === "marquee") {
+      if (e.button) return; // só botão principal; right/middle → menu nativo
+      e.preventDefault();
+      e.stopPropagation();
+      startMarquee(e);
+      return;
+    }
+
     const el = e.target.closest("*");
     if (!el || el === document.body || el === document.documentElement) return;
 
@@ -1016,19 +1227,8 @@
     // Modo SELETOR (inspecionar): só seleciona — nunca move nem redimensiona.
     if (!isEditing()) { e.preventDefault(); e.stopPropagation(); return; }
 
-    const r = el.getBoundingClientRect();
-    const inCorner = e.clientX > r.right - RESIZE_CORNER && e.clientY > r.bottom - RESIZE_CORNER;
-    if (inCorner) {
-      // deixa o resize NATIVO (resize:both) agir; só capturamos o tamanho no fim
-      pushUndo([el]);
-      markBaseline(el); // grava o "before" antes da 1ª mutação
-      const finish = () => {
-        record(el);
-        window.removeEventListener("pointerup", finish, true);
-      };
-      window.addEventListener("pointerup", finish, true);
-      return;
-    }
+    // resize agora é via grip ↘ próprio (.dm-rzh / onRzDown) — afeta TODOS os selecionados
+    // e imanta no Shift. Arrastar o corpo do elemento move (abaixo).
 
     // drag: move TODOS os selecionados juntos (via transform translate)
     e.preventDefault();
@@ -1046,6 +1246,7 @@
     buildSnapTargets(new Set(els));
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true); // gesto cancelado (touch/pen) também encerra
   }
 
   function onMove(e) {
@@ -1090,6 +1291,264 @@
     repositionNotes();
     window.removeEventListener("pointermove", onMove, true);
     window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onUp, true);
+  }
+
+  // ── SELEÇÃO POR RETÂNGULO (marquee) — ferramenta "marquee" ────────────────────
+  // Vale em inspecionar E editar. Arrastar desenha a caixa; "encostou já pega"
+  // (intersecção). Pega só os elementos MAIS EXTERNOS (sem filhos de um já pego),
+  // ignora os containers que ENGLOBAM o retângulo (fundo), o body/html e os artefatos
+  // da ferramenta. Clique sem arrasto continua selecionando 1 (Shift alterna/soma).
+  // Candidatos em coords de DOCUMENTO (+scroll) — assim rolar a página no meio do arrasto
+  // não corrompe o que o retângulo pega, e dá pra marquear além da dobra rolando.
+  function marqueeCandidates() {
+    const out = [];
+    let count = 0;
+    const sx = window.scrollX, sy = window.scrollY;
+    for (const el of document.querySelectorAll("body *")) {
+      if (count > 4000) break;
+      if (inBar(el) || isDmOverlay(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue; // só descarta área zero (finos/hairlines valem)
+      out.push({ el, r: { left: r.left + sx, top: r.top + sy, right: r.right + sx, bottom: r.bottom + sy } });
+      count++;
+    }
+    return out;
+  }
+  function normMarquee(m) {
+    return {
+      left: Math.min(m.x0, m.x1), top: Math.min(m.y0, m.y1),
+      right: Math.max(m.x0, m.x1), bottom: Math.max(m.y0, m.y1),
+    };
+  }
+  function rectsTouch(M, r) {
+    return r.left <= M.right && r.right >= M.left && r.top <= M.bottom && r.bottom >= M.top;
+  }
+  function rectEncloses(r, M) {
+    return r.left <= M.left && r.right >= M.right && r.top <= M.top && r.bottom >= M.bottom;
+  }
+  function marqueeHits(M) {
+    if (!marquee) return [];
+    // toca o retângulo E não o engloba (containers de fundo ficam de fora)
+    const inter = marquee.cands.filter((c) => rectsTouch(M, c.r) && !rectEncloses(c.r, M));
+    const set = new Set(inter.map((c) => c.el));
+    // só os mais externos: descarta quem tem um ancestral também pego
+    return inter.filter((c) => {
+      let p = c.el.parentElement;
+      while (p) { if (set.has(p)) return false; p = p.parentElement; }
+      return true;
+    }).map((c) => c.el);
+  }
+  function startMarquee(e) {
+    if (marquee) cancelMarquee(); // robustez: nunca empilha dois retângulos
+    marquee = {
+      x0: e.clientX + window.scrollX, y0: e.clientY + window.scrollY, // âncora em coords de documento
+      x1: e.clientX + window.scrollX, y1: e.clientY + window.scrollY,
+      cx: e.clientX, cy: e.clientY, // último ponto em coords de viewport (p/ a caixa fixed + elementFromPoint)
+      add: e.shiftKey, cands: marqueeCandidates(), hi: new Set(), box: null, moved: false,
+    };
+    window.addEventListener("pointermove", onMarqueeMove, true);
+    window.addEventListener("pointerup", onMarqueeUp, true);
+    window.addEventListener("pointercancel", onMarqueeUp, true);
+    window.addEventListener("scroll", onMarqueeScroll, true); // rolar redesenha sem mexer o ponteiro
+  }
+  function onMarqueeMove(e) {
+    if (!marquee) return;
+    marquee.cx = e.clientX; marquee.cy = e.clientY;
+    drawMarquee();
+  }
+  function onMarqueeScroll() { if (marquee) drawMarquee(); }
+  function drawMarquee() {
+    marquee.x1 = marquee.cx + window.scrollX; marquee.y1 = marquee.cy + window.scrollY;
+    // só materializa a caixa/realce depois de passar o limiar de 4px (senão pisca no clique).
+    if (!marquee.moved && Math.abs(marquee.x1 - marquee.x0) + Math.abs(marquee.y1 - marquee.y0) < 4) return;
+    marquee.moved = true;
+    const M = normMarquee(marquee); // coords de documento
+    if (!marquee.box) {
+      marquee.box = document.createElement("div");
+      marquee.box.className = "dm-marquee";
+      (document.body || document.documentElement).appendChild(marquee.box);
+    }
+    const b = marquee.box; // a caixa é position:fixed → desenha em viewport (documento − scroll)
+    b.style.left = (M.left - window.scrollX) + "px"; b.style.top = (M.top - window.scrollY) + "px";
+    b.style.width = (M.right - M.left) + "px"; b.style.height = (M.bottom - M.top) + "px";
+    setMarqueeHighlight(marqueeHits(M)); // realce ao vivo do que vai entrar
+  }
+  function setMarqueeHighlight(hits) {
+    const next = new Set(hits);
+    const prev = marquee.hi || new Set();
+    for (const el of prev) if (!next.has(el)) el.classList.remove("dm-marquee-hit");
+    for (const el of next) if (!prev.has(el)) el.classList.add("dm-marquee-hit");
+    marquee.hi = next;
+  }
+  function clearMarqueeHighlight() {
+    if (marquee && marquee.hi) marquee.hi.forEach((el) => el.classList.remove("dm-marquee-hit"));
+    document.querySelectorAll(".dm-marquee-hit").forEach((n) => n.classList.remove("dm-marquee-hit"));
+  }
+  function detachMarqueeListeners() {
+    window.removeEventListener("pointermove", onMarqueeMove, true);
+    window.removeEventListener("pointerup", onMarqueeUp, true);
+    window.removeEventListener("pointercancel", onMarqueeUp, true);
+    window.removeEventListener("scroll", onMarqueeScroll, true);
+  }
+  function onMarqueeUp() {
+    detachMarqueeListeners();
+    if (!marquee) return;
+    const moved = marquee.moved;
+    const M = normMarquee(marquee);
+    clearMarqueeHighlight();
+    if (!moved) {
+      // clique sem arrasto: preserva o "clicar seleciona 1" (Shift alterna) — viewport coords
+      const hit = document.elementFromPoint(marquee.cx, marquee.cy);
+      const t = hit && hit.closest ? hit.closest("*") : null;
+      if (t && t !== document.body && t !== document.documentElement && !inBar(t)) {
+        if (marquee.add) toggleSel(t); else selectOnly(t);
+      }
+    } else {
+      const hits = marqueeHits(M);
+      if (!marquee.add) clearSel();
+      for (const el of hits) addSel(el);
+      uiNotifySafe(hits.length + " selecionado(s) pelo retângulo.", hits.length ? "ok" : "warn");
+    }
+    if (marquee.box && marquee.box.parentNode) marquee.box.parentNode.removeChild(marquee.box);
+    marquee = null;
+    updateCur();
+  }
+  function cancelMarquee() {
+    detachMarqueeListeners();
+    clearMarqueeHighlight();
+    if (marquee && marquee.box && marquee.box.parentNode) marquee.box.parentNode.removeChild(marquee.box);
+    marquee = null;
+  }
+
+  // ── EDIÇÃO DE TEXTO NO LUGAR — ferramenta "text" ──────────────────────────────
+  // Clicar torna o elemento contenteditable; Enter confirma, Esc cancela (reverte),
+  // clicar fora confirma. A mudança entra em textEdits (vai pro spec e é salva no HTML).
+  function startTextEdit(el) {
+    if (!el || el.nodeType !== 1) return;
+    if (textEdit && textEdit.el === el) return;
+    if (textEdit) endTextEdit(true);
+    const before = el.innerHTML;
+    el.setAttribute("contenteditable", "true");
+    el.classList.add("dm-text-editing");
+    textEdit = { el, before };
+    el.addEventListener("keydown", onTextKey, true);
+    el.addEventListener("blur", onTextBlur, true);
+    // engole o click que fecha ESTA sequência de ponteiro — senão um <button>/<a>/[onclick]
+    // da página dispararia/navegaria (perdendo edições não salvas). One-shot, auto-removível.
+    const eatClick = (ev) => { ev.preventDefault(); ev.stopImmediatePropagation(); window.removeEventListener("click", eatClick, true); };
+    window.addEventListener("click", eatClick, true);
+    try { el.focus(); } catch (_) {}
+    updateCur();
+  }
+  function onTextKey(e) {
+    e.stopPropagation(); // isola a digitação dos atalhos globais (defesa extra; onKey já sai cedo)
+    if (e.key === "Escape") { e.preventDefault(); endTextEdit(false); }
+    else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); endTextEdit(true); }
+  }
+  function onTextBlur() { if (textEdit) endTextEdit(true); }
+  function endTextEdit(save) {
+    if (!textEdit) return;
+    const el = textEdit.el, before = textEdit.before;
+    textEdit = null;
+    el.removeEventListener("keydown", onTextKey, true);
+    el.removeEventListener("blur", onTextBlur, true);
+    el.removeAttribute("contenteditable");
+    el.classList.remove("dm-text-editing");
+    const after = el.innerHTML;
+    if (!save) { el.innerHTML = before; } // cancelou → reverte
+    else if (after !== before) { recordTextEdit(el, before, after); }
+    updateCur();
+  }
+  function recordTextEdit(el, before, after) {
+    undoStack.push({ kind: "text", el, before, after });
+    trimUndo();
+    const prev = textEdits.get(el);
+    textEdits.set(el, { before: prev ? prev.before : before, after }); // before = o estado original
+    repositionNotes();
+  }
+
+  // ── RESIZE pelo grip ↘ (overlay próprio) — afeta TODOS os selecionados ─────────
+  // Substitui o resize:both nativo: aplica o MESMO delta (dw,dh) a cada selecionado
+  // (igual ao resize por teclado). Segurando SHIFT, imanta a borda direita/baixo do
+  // elemento-âncora às bordas/centros de outros elementos (mesma engine do snap do drag),
+  // ajudando a manter o alinhamento. Só aparece em editar + ferramenta "move" + 1+ seleção.
+  function ensureRzHandle() {
+    if (rzHandle) return;
+    rzHandle = document.createElement("div");
+    rzHandle.className = "dm-rzh";
+    rzHandle.title = "arraste pra redimensionar TODOS os selecionados · segure Shift pra alinhar";
+    (document.body || document.documentElement).appendChild(rzHandle);
+    rzHandle.addEventListener("pointerdown", onRzDown, true);
+  }
+  function positionRzHandle() {
+    const show = mode === "edit" && tool === "move" && selected.size >= 1 && !drag && !marquee && !textEdit;
+    if (!show) { if (rzHandle) rzHandle.style.display = "none"; return; }
+    ensureRzHandle();
+    const anchor = [...selected][selected.size - 1]; // último selecionado = âncora do grip
+    if (!anchor || !anchor.isConnected) { rzHandle.style.display = "none"; return; }
+    const r = anchor.getBoundingClientRect();
+    rzHandle.__anchor = anchor;
+    rzHandle.style.display = "block";
+    rzHandle.style.left = (r.right - 7) + "px";
+    rzHandle.style.top = (r.bottom - 7) + "px";
+  }
+  function onRzDown(e) {
+    if (mode !== "edit" || !selected.size) return;
+    e.preventDefault(); e.stopPropagation();
+    const anchor = (rzHandle && rzHandle.__anchor) || [...selected][selected.size - 1];
+    const els = [...selected];
+    pushUndo(els);
+    resize = { sx: e.clientX, sy: e.clientY, anchor, base: new Map(), targetXs: [], targetYs: [], snapX: null, snapY: null };
+    for (const el of els) { markBaseline(el); ensureMovable(el); resize.base.set(el, { w: el.offsetWidth, h: el.offsetHeight }); }
+    resize.anchorRect0 = anchor.getBoundingClientRect();
+    edgeTargets(new Set(els), resize.targetXs, resize.targetYs); // alvos de snap (Shift)
+    try { rzHandle.setPointerCapture(e.pointerId); } catch (_) {}
+    window.addEventListener("pointermove", onRzMove, true);
+    window.addEventListener("pointerup", onRzUp, true);
+    window.addEventListener("pointercancel", onRzUp, true); // gesto cancelado também encerra
+  }
+  function onRzMove(e) {
+    if (!resize) return;
+    let dw = e.clientX - resize.sx, dh = e.clientY - resize.sy;
+    resize.snapX = resize.snapY = null;
+    if (e.shiftKey) { // SHIFT = alinhar: imanta a borda direita/baixo do âncora
+      const a = resize.anchorRect0;
+      const sx = nearestSnap([a.right + dw], resize.targetXs);
+      const sy = nearestSnap([a.bottom + dh], resize.targetYs);
+      if (sx) { dw += sx.delta; showGuide("v", sx.pos); showTargetBox("v", sx.target); resize.snapX = sx; } else { showGuide("v", null); showTargetBox("v", null); }
+      if (sy) { dh += sy.delta; showGuide("h", sy.pos); showTargetBox("h", sy.target); resize.snapY = sy; } else { showGuide("h", null); showTargetBox("h", null); }
+    } else { showGuide("v", null); showGuide("h", null); showTargetBox("v", null); showTargetBox("h", null); }
+    for (const [el, b] of resize.base) {
+      ensureBorderBox(el); // base = offsetWidth (border-box); força border-box p/ bater 1:1
+      setImp(el, "width", Math.max(8, b.w + dw) + "px");
+      setImp(el, "height", Math.max(8, b.h + dh) + "px");
+    }
+    positionRzHandle();
+    repositionNotes();
+    const c = bar.querySelector("#dm-cur");
+    if (c) c.textContent = resize.anchor.offsetWidth + "×" + resize.anchor.offsetHeight + (resize.base.size > 1 ? " (+" + (resize.base.size - 1) + ")" : "");
+  }
+  function onRzUp() {
+    if (resize) {
+      for (const el of resize.base.keys()) record(el);
+      // grava a constraint do encaixe (qual borda casou com quem) pra dica de layout do spec
+      const c = changes.get(resize.anchor);
+      if (c && (resize.snapX || resize.snapY)) {
+        const snap = {};
+        if (resize.snapX) snap.x = snapAxis(resize.snapX, ["right", "right", "right"]);
+        if (resize.snapY) snap.y = snapAxis(resize.snapY, ["bottom", "bottom", "bottom"]);
+        c.snap = Object.assign(c.snap || {}, snap);
+      }
+      reapplyRules();
+    }
+    resize = null;
+    showGuide("v", null); showGuide("h", null); showTargetBox("v", null); showTargetBox("h", null);
+    window.removeEventListener("pointermove", onRzMove, true);
+    window.removeEventListener("pointerup", onRzUp, true);
+    window.removeEventListener("pointercancel", onRzUp, true);
+    positionRzHandle();
+    repositionNotes();
   }
 
   // Materializa a identidade do alvo vencedor (selectorOf SÓ aqui — não nos 600 alvos).
@@ -1140,6 +1599,16 @@
     if (displayForced.has(el)) return;
     try {
       if (getComputedStyle(el).display === "inline") { setImp(el, "display", "inline-block"); displayForced.add(el); }
+    } catch (_) {}
+  }
+
+  // O resize grava offsetWidth/Height (border-box) como width/height CSS. Em elementos
+  // content-box (padrão do CSS) isso somaria padding+borda e o objeto "pularia"; forçar
+  // border-box faz o que-você-vê-é-o-que-grava. Mede ANTES de chamar (forçar muda o offset).
+  function ensureBorderBox(el) {
+    if (boxSizingForced.has(el)) return;
+    try {
+      if (getComputedStyle(el).boxSizing !== "border-box") { setImp(el, "box-sizing", "border-box"); boxSizingForced.add(el); }
     } catch (_) {}
   }
 
@@ -1288,15 +1757,13 @@
     return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/[^\w-]/g, "\\$&");
   }
 
-  function copyLayout() {
-    if (!changes.size) {
-      uiNotifySafe("Nenhuma alteração pra copiar — arraste/redimensione algo primeiro.", "warn");
-      return;
-    }
+  // Gera os blocos CSS das mudanças de geometria (reusado por copyLayout e copyAll).
+  function layoutBlocks() {
     const blocks = [];
     for (const c of changes.values()) {
       if (!c.el.isConnected) continue; // ignora nós já removidos
       const decls = [`  width: ${c.w}px;`, `  height: ${c.h}px;`];
+      if (boxSizingForced.has(c.el)) decls.push(`  box-sizing: border-box;`); // resize mediu/gravou em border-box
       if (c.tx || c.ty) decls.push(`  transform: translate(${c.tx}px, ${c.ty}px);`);
       if (displayForced.has(c.el)) decls.push(`  display: inline-block;`); // era inline → precisa disso pro transform pegar
       const detached = c.struct && c.struct.kind === "detach";
@@ -1311,6 +1778,15 @@
       else if (c.snap) { const ph = snapToConstraint(c.snap); if (ph) decls.push(`  /* layout hint: ${ph} */`); }
       if (detached) decls.push(`  /* layout hint: solto do fluxo, ancorado em ${c.struct.parent} */`);
       blocks.push(`${selectorOf(c.el)} {\n${decls.join("\n")}\n}`);
+    }
+    return blocks;
+  }
+
+  function copyLayout() {
+    const blocks = layoutBlocks();
+    if (!blocks.length) {
+      uiNotifySafe("Nenhuma alteração pra copiar — arraste/redimensione algo primeiro.", "warn");
+      return;
     }
     const css = "/* design-mode export — colar no styles.css */\n" + blocks.join("\n\n") + "\n";
     writeClipboard(css, `Layout copiado (${blocks.length} bloco(s)).`);
@@ -1334,7 +1810,7 @@
   // data-dm* de todo nó. As edições (estilos inline de transform/width/...) permanecem.
   function serializeCleanHTML() {
     const root = document.documentElement.cloneNode(true);
-    root.querySelectorAll(".dm-bar, .dm-guide, .dm-snapbox, .dm-note-pop, .dm-note-badge, .dm-detach, [data-dm-style]")
+    root.querySelectorAll(".dm-bar, .dm-guide, .dm-snapbox, .dm-marquee, .dm-rzh, .dm-note-pop, .dm-note-badge, .dm-detach, [data-dm-style]")
       .forEach((n) => n.remove());
     const all = [root, ...root.querySelectorAll("*")];
     for (const n of all) {
@@ -1362,6 +1838,7 @@
 
   // asNew=true força escolher arquivo/destino (Salvar como). asNew=false reusa o handle.
   async function saveFile(asNew) {
+    if (textEdit) endTextEdit(true); // confirma a edição de texto em curso (tira o contenteditable)
     const html = serializeCleanHTML();
     // Caminho 1 — File System Access API (sobrescreve no lugar). Só existe em contexto
     // seguro (localhost/https); em file:// window.showSaveFilePicker é undefined → fallback.
@@ -1388,7 +1865,17 @@
   }
 
   function resetAll() {
+    if (textEdit) endTextEdit(true); // confirma edição de texto em curso antes de resetar
     if (changes.size) pushUndo([...changes.keys()]); // reset também é desfazível
+    // reverte os textos editados (cada um vira um passo de undo: restaura o texto editado)
+    for (const [el, te] of textEdits) {
+      if (!el.isConnected) continue;
+      // restore: re-rastreia o item em textEdits se o usuário desfizer o reset (Ctrl+Z)
+      undoStack.push({ kind: "text", el, before: te.after, after: te.before, restore: { before: te.before, after: te.after } });
+      el.innerHTML = te.before;
+    }
+    textEdits.clear();
+    trimUndo();
     for (const c of changes.values()) {
       if (!c.el.isConnected) continue;
       setImp(c.el, "transform", "");
@@ -1398,11 +1885,13 @@
       if (c.posForced) setImp(c.el, "position", "");
       if (c.struct) { setImp(c.el, "position", ""); setImp(c.el, "top", ""); setImp(c.el, "left", ""); }
       if (displayForced.has(c.el)) setImp(c.el, "display", "");
+      if (boxSizingForced.has(c.el)) setImp(c.el, "box-sizing", "");
       c.el.classList.remove("dm-editable", "dm-sel");
     }
     changes.clear();
     baselines.clear(); // zera os "before" do spec junto com as edições
     displayForced.clear();
+    boxSizingForced.clear();
     document.querySelectorAll("[data-dm-group]").forEach((n) => {
       n.removeAttribute("data-dm-group");
       n.classList.remove("dm-grouped");
@@ -1508,6 +1997,7 @@
       positionDetach(ov, el);
     }
     if (notePop) positionPop(notePop.pop, notePop.el);
+    positionRzHandle(); // grip ↘ acompanha scroll/resize/drag
   }
   function clearNotes() {
     closeNote(false);
@@ -1533,10 +2023,17 @@
 
   // change-set determinístico: UNIÃO de geometria (changes) + intenção (notes). Elementos
   // SÓ com nota entram como entradas de intenção pura. Cada item carrega âncora redundante.
+  // texto legível (sem tags) de um trecho de innerHTML — p/ mostrar a mudança no spec.
+  function htmlToText(s) {
+    const d = document.createElement("div");
+    d.innerHTML = s;
+    return (d.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160);
+  }
   function buildSpec() {
     const els = new Set();
     for (const c of changes.values()) if (c.el && c.el.isConnected) els.add(c.el);
     for (const el of notes.keys()) if (el.isConnected) els.add(el);
+    for (const el of textEdits.keys()) if (el.isConnected) els.add(el);
     const out = [];
     for (const el of els) {
       const c = changes.get(el);
@@ -1559,6 +2056,8 @@
         note: n ? (n.text || "") : "",
         intents: n ? [...n.types] : [],
       };
+      const te = textEdits.get(el);
+      if (te) entry.text = { before: htmlToText(te.before), after: htmlToText(te.after) };
       const constraint = (c && ruleConstraint(c)) || (c && c.snap ? snapToConstraint(c.snap) : null);
       if (constraint) entry.constraint = constraint;
       if (displayForced.has(el)) entry.displayForced = true;
@@ -1594,6 +2093,7 @@
         lines.push(`- [ ] tamanho ${it.after.w}×${it.after.h}, translate(${it.after.tx},${it.after.ty})` +
           (it.after.z != null ? `, z-index ${it.after.z}` : ""));
       }
+      if (it.text) lines.push(`- [ ] texto: "${it.text.before}" → "${it.text.after}"`);
       if (it.constraint) lines.push("- dica de layout: " + it.constraint);
       if (it.struct && it.struct.kind === "detach")
         lines.push(`- estrutura: tirar do fluxo (position:${it.struct.position}, ancorado em ${it.struct.parent})`);
@@ -1639,6 +2139,39 @@
       `Notas copiadas (${arr.length}).`);
   }
 
+  // ⧉ TUDO num pacote só: Spec (intenção+geometria+notas) + Layout CSS + Seletores + HTML.
+  function copyAll() {
+    const spec = buildSpec();                 // já reúne notas + intenção + geometria + âncora
+    const blocks = layoutBlocks();            // CSS das mudanças
+    // conjunto de elementos: selecionados ∪ alterados ∪ anotados, em ordem de documento
+    const set = new Set([...selected]);
+    for (const c of changes.values()) if (c.el && c.el.isConnected) set.add(c.el);
+    for (const el of notes.keys()) if (el.isConnected) set.add(el);
+    const els = [...set].filter((e) => e.isConnected).sort((a, b) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+    if (!spec.length && !blocks.length && !els.length) {
+      uiNotifySafe("Nada pra copiar — selecione, mova/redimensione ou anote (N) algo.", "warn");
+      return;
+    }
+    const parts = ["# design-mode — pacote completo",
+      "Intenção visual do humano pro agente programador aplicar. Seções: spec, layout, seletores, HTML.", ""];
+    if (spec.length) {
+      parts.push("## 1) Spec (intenção + geometria + notas)", "", specMarkdown(spec),
+        "```json", JSON.stringify(spec, null, 2), "```", "");
+    }
+    if (blocks.length) {
+      parts.push("## 2) Layout (CSS das mudanças)", "", "```css",
+        "/* colar no styles.css */\n" + blocks.join("\n\n"), "```", "");
+    }
+    if (els.length) {
+      parts.push("## 3) Seletores", "", "```", els.map(selectorOf).join(",\n"), "```", "");
+      const htmls = els.map((e) => { const cl = e.cloneNode(true); stripDmState(cl); return cl.outerHTML; });
+      parts.push("## 4) HTML dos elementos", "", "```html", htmls.join("\n\n"), "```", "");
+    }
+    writeClipboard(parts.join("\n") + "\n",
+      `Tudo copiado · spec:${spec.length} · layout:${blocks.length} · elementos:${els.length}.`);
+  }
+
   function uiNotifySafe(msg, kind) {
     if (typeof window.uiNotify === "function") window.uiNotify(msg, kind);
     else console.log("[design-mode]", msg);
@@ -1647,6 +2180,7 @@
   // ── API pública ──
   const API = {
     __installed: true,
+    version: DM_VERSION,
     setMode(m) { setMode(m); },
     select() { setMode("select"); },
     edit() { setMode("edit"); },
@@ -1657,12 +2191,12 @@
     setStatic(v) { setStatic(!!v); },
     toggleStatic() { toggleStatic(); },
     isStatic() { return staticOn; },
+    setTool(t) { setTool(t); },
+    tool() { return tool; },
     isOn() { return mode !== "off"; },
     isEditing() { return mode === "edit"; },
     mode() { return mode; },
   };
-  window.DesignMode = API;
-
   // ── auto-bootstrap opcional via atributo no <script> ──
   function maybeAutostart() {
     const cur = document.currentScript ||
@@ -1670,5 +2204,200 @@
     boot(); // sempre injeta a barra
     if (cur && cur.hasAttribute("data-autostart")) setMode("edit");
   }
+
+  // ── IFRAMES (páginas-moldura / hub com sub-apps) ───────────────────────────
+  // O design-mode opera SÓ no próprio document. Uma página-MOLDURA/HUB (um shell que
+  // carrega o app real dentro de <iframe> — ex.: "Intra" → /performance/...) só fica
+  // editável de verdade se o design-mode DESCER pra dentro de cada iframe; senão você
+  // "só edita o header/barra de cima". Aqui:
+  //   • descemos pra TODOS os <iframe> mesma-origem (não só o maior ≥60%);
+  //   • CONTINUAMOS observando (observer coalescido + sweep) os que aparecem/recarregam
+  //     DEPOIS — SPAs (React/Vite) montam o iframe do app só após o boot, e troca de
+  //     rota recria o frame;
+  //   • cada frame que NASCE puxa o estado atual do pai (handshake "req:state"), então
+  //     um frame montado/recarregado tarde HERDA o modo ativo da moldura — sem re-
+  //     sincronizar os outros (preserva o toggle independente por frame);
+  //   • um comando global (Alt+D etc.) desce UMA vez pra todos: mesma-origem chamando
+  //     __applyState do frame, cross-origin via postMessage.
+  // CROSS-ORIGIN (sub-app noutra porta/host, ex.: :5173 embute :3001) o navegador
+  // BLOQUEIA o inject in-page: aí o sub-app só ganha a própria barra quando a EXTENSÃO
+  // injeta (allFrames + host <all_urls>; o bg.js também reinjeta no recarregar do sub-
+  // frame via webNavigation). O bookmarklet, por segurança do navegador, NÃO alcança
+  // cross-origin — use a extensão nesse caso.
+  const DM_SELF_SRC = "(" + DM_INSTALL.toString() + ")();";
+  const DM_MSG = "__dm_cmd_v1"; // assinatura das mensagens entre frames
+
+  function allFrames() { return [...document.querySelectorAll("iframe")]; }
+
+  // injeta o design-mode DENTRO de um iframe mesma-origem. true = coberto (já tinha ou
+  // acabou de receber); false = cross-origin / ainda carregando / sandbox-CSP.
+  function injectInto(frame) {
+    let d, w;
+    try { d = frame.contentDocument; w = frame.contentWindow; } catch (_) { return false; } // cross-origin
+    if (!d || !w) return false;
+    try { if (w.DesignMode && w.DesignMode.__installed) return true; } catch (_) { return false; }
+    if (!d.body) return false; // ainda carregando — o 'load' reinjeta
+    try {
+      const s = d.createElement("script");
+      s.setAttribute("data-dm-injected", "");
+      s.textContent = DM_SELF_SRC;
+      d.body.appendChild(s);
+      s.remove();
+      return true;
+    } catch (_) { return false; } // sandbox sem allow-scripts / CSP estrito
+  }
+
+  // garante o design-mode em CADA iframe mesma-origem; ata um 'load' (1x por frame, com
+  // o handler guardado em dmWatched p/ remover no quit) pra reinjetar em recargas/
+  // navegações — o doc novo perde o window.DesignMode e, ao bootar, puxa o estado do pai.
+  function descendAll() {
+    if (dmQuit) return;
+    for (const frame of allFrames()) {
+      if (!dmWatched.has(frame)) {
+        const onLoad = () => { if (!dmQuit) injectInto(frame); };
+        dmWatched.set(frame, onLoad);
+        frame.addEventListener("load", onLoad);
+      }
+      injectInto(frame);
+    }
+  }
+  // observer com coalescing: SPAs disparam mutações em rajada — agenda 1 descend só.
+  function scheduleDescend() {
+    if (dmQuit || frameKick) return;
+    frameKick = setTimeout(() => { frameKick = null; if (!dmQuit) { descendAll(); updateMoldura(); } }, 100);
+  }
+
+  // O maior iframe (de QUALQUER origem — o tamanho é legível mesmo cross-origin) cobrindo
+  // >=60% do viewport: só pra ROTULAR a barra deste frame como "moldura" (cosmético). A
+  // DESCIDA acontece pra todos, à parte disto.
+  function primaryChildFrame() {
+    const vw = document.documentElement.clientWidth || window.innerWidth || 1;
+    const vh = document.documentElement.clientHeight || window.innerHeight || 1;
+    let best = null, bestArea = 0;
+    for (const frame of allFrames()) {
+      const r = frame.getBoundingClientRect();
+      const area = Math.max(0, r.width) * Math.max(0, r.height);
+      if (area > bestArea) { bestArea = area; best = frame; }
+    }
+    return best && bestArea / (vw * vh) >= 0.6 ? best : null;
+  }
+  let isMoldura = false;
+  function updateMoldura() {
+    const want = !!primaryChildFrame();
+    if (want === isMoldura) return; // re-avalia (desfaz o rótulo se o filho dominante sumir)
+    isMoldura = want;
+    API.__wrapper = want || undefined;
+    bar.classList.toggle("dm-bar-frame", want); // canto inferior-ESQUERDO + âmbar
+    const tgl = bar.querySelector("#dm-toggle");
+    if (tgl) {
+      tgl.textContent = want ? "▣ moldura" : "▣ design";
+      tgl.title = want
+        ? "Barra da MOLDURA (edita o shell/header de cima). O APP é editado pela barra DENTRO do preview. Clique abre/fecha · arraste move."
+        : "clique pra abrir/fechar · arraste pra mover";
+    }
+  }
+
+  // aplica o ESTADO ABSOLUTO (modo/estático/ferramenta) NESTE frame via setters LIVRES
+  // (sem re-disparar o wrapper) e desce UMA vez pros filhos. Idempotente.
+  function applyState(m, st, tl) {
+    if (typeof m === "string") setMode(m);
+    setStatic(!!st);
+    if (typeof tl === "string") setTool(tl);
+    pushToChildren(m, st, tl);
+  }
+  // empurra o estado pra cada filho: mesma-origem chama __applyState direto (cascateia 1
+  // vez — sem 3^profundidade); cross-origin manda por postMessage (o sub-app, se tiver
+  // design-mode via extensão, aplica).
+  function pushToChildren(m, st, tl) {
+    for (const frame of allFrames()) {
+      let direct = false;
+      try {
+        const dm = frame.contentWindow && frame.contentWindow.DesignMode;
+        if (dm && dm.__installed && typeof dm.__applyState === "function") { dm.__applyState(m, st, tl); direct = true; }
+      } catch (_) { /* cross-origin */ }
+      if (!direct) {
+        try { frame.contentWindow && frame.contentWindow.postMessage({ [DM_MSG]: true, cmd: "__sync", args: [m, st, tl] }, "*"); } catch (_) {}
+      }
+    }
+  }
+
+  function quitChildren() {
+    for (const frame of allFrames()) {
+      try { const w = frame.contentWindow; if (w && w.DesignMode && w.DesignMode.__installed) { w.DesignMode.quit(); continue; } } catch (_) {}
+      try { frame.contentWindow && frame.contentWindow.postMessage({ [DM_MSG]: true, cmd: "quit", args: [] }, "*"); } catch (_) {}
+    }
+  }
+
+  // diagnóstico: lista os iframes deste frame, marcando mesma-origem vs cross-origin e
+  // se o design-mode chegou (covered). Rode no console: DesignMode.frameReport().
+  function frameReport() {
+    const frames = allFrames();
+    const rows = frames.map((f) => {
+      let same = false, covered = false, href = "(cross-origin — só a EXTENSÃO alcança)";
+      try { if (f.contentDocument) { same = true; href = f.contentWindow.location.href; covered = !!(f.contentWindow.DesignMode && f.contentWindow.DesignMode.__installed); } } catch (_) {}
+      const r = f.getBoundingClientRect();
+      return { src: f.getAttribute("src") || "(sem src)", same, covered, href, size: Math.round(r.width) + "×" + Math.round(r.height) };
+    });
+    try {
+      console.groupCollapsed(`[design-mode] ${frames.length} iframe(s) neste frame (same=mesma-origem · covered=design-mode chegou)`);
+      if (console.table) console.table(rows); else console.log(rows);
+      const cross = rows.filter((r) => !r.same).length;
+      if (cross) console.warn(`[design-mode] ${cross} iframe(s) CROSS-ORIGIN: bookmarklet/inject in-page NÃO alcança. Use a EXTENSÃO (injeta com allFrames).`);
+      console.groupEnd();
+    } catch (_) {}
+    return rows;
+  }
+
+  // mensagens entre frames. COMANDOS (__sync/quit) só são aceitos do PAI (descem). Um
+  // FILHO meu pode PEDIR o estado ("req:state") ao nascer — respondo só pra ele.
+  dmMsgHandler = function (e) {
+    const d = e && e.data;
+    if (!d || d[DM_MSG] !== true) return;
+    if (d.req === "state") { // pull de um filho recém-nascido → devolvo o estado atual
+      try { if (allFrames().some((f) => f.contentWindow === e.source)) e.source.postMessage({ [DM_MSG]: true, cmd: "__sync", args: [mode, staticOn, tool] }, "*"); } catch (_) {}
+      return;
+    }
+    if (e.source !== window.parent) return; // comandos só DESCEM (do pai); bloqueia filho/irmão
+    try {
+      if (d.cmd === "__sync") { const a = Array.isArray(d.args) ? d.args : []; applyState(a[0], a[1], a[2]); }
+      else if (d.cmd === "quit") { API.quit(); }
+    } catch (_) {}
+  };
+
+  // Barra DESTE frame primeiro (edita ESTE documento — vale também pra moldura).
+  window.DesignMode = API;
+  API.__applyState = applyState; // o pai chama isto em filhos mesma-origem (cascata 1x)
+  API.frameReport = frameReport;
   maybeAutostart();
+
+  // TODO frame vira propagador (no-op se não tiver filhos): um comando global desce 1x
+  // pra todos os iframes. Usa pushToChildren (não os setters wrapped) → sem 3^profundidade.
+  ["setMode", "select", "edit", "enable", "disable", "toggle", "setStatic", "toggleStatic", "setTool"].forEach((m) => {
+    const local = API[m];
+    API[m] = function (...a) {
+      const r = typeof local === "function" ? local.apply(API, a) : undefined;
+      descendAll();                         // garante o script nos filhos
+      pushToChildren(mode, staticOn, tool); // empurra o estado absoluto 1x
+      return r;
+    };
+  });
+  window.addEventListener("message", dmMsgHandler);
+  // este frame é um FILHO? puxa o estado atual do pai (herda o modo ativo da moldura,
+  // mesmo montando/recarregando depois do boot — cobre o caso do hub SPA).
+  if (window.parent && window.parent !== window) {
+    try { window.parent.postMessage({ [DM_MSG]: true, req: "state" }, "*"); } catch (_) {}
+  }
+
+  // descida inicial + observação contínua: SPAs montam/recarregam iframes após o boot.
+  // O observer (coalescido) responde rápido; o sweep é rede de segurança. Ambos no-op
+  // após ✕ (dmQuit) e são limpos no quit().
+  descendAll();
+  updateMoldura();
+  if (mode !== "off") pushToChildren(mode, staticOn, tool); // data-autostart: propaga o modo inicial
+  try {
+    frameObserver = new MutationObserver(scheduleDescend);
+    frameObserver.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (_) {}
+  frameSweep = setInterval(() => { if (!dmQuit) { descendAll(); updateMoldura(); } }, 1500);
+  setTimeout(() => { if (!dmQuit && allFrames().length) frameReport(); }, 1200); // 1 relatório p/ diagnóstico
 })();

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>design-mode — demo</title>
+  <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzBiMGQxMCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTYlIiBmb250LXNpemU9IjEyIiBmb250LWZhbWlseT0ibW9ub3NwYWNlIiBmaWxsPSIjMWRjMDc3IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkb21pbmFudC1iYXNlbGluZT0ibWlkZGxlIj4mbHQ7LyZndDs8L3RleHQ+PC9zdmc+">
   <style>
     :root { font-family: system-ui, sans-serif; }
     body { margin: 0; padding: 24px 24px 120px; background: #0e1116; color: #e6edf3; }
@@ -37,10 +38,12 @@
   </div>
 
   <div class="hint">
-    Atalhos: <strong>arrastar</strong> = mover · <strong>canto ↘</strong> = redimensionar ·
-    <strong>Shift+clique</strong> = multi-seleção · <strong>Ctrl+C / Ctrl+V</strong> = copiar/colar ·
-    <strong>Del</strong> = apagar · <strong>Ctrl+Z</strong> = desfazer ·
-    <code>📋 copiar layout</code> = exporta CSS.
+    Ferramentas (na barra ou por tecla): <code>V</code> ✥ mover · <code>M</code> ▦ seleção (arraste um
+    retângulo — encostou já pega) · <code>T</code> texto (clica e edita no lugar).<br>
+    Atalhos: <strong>arrastar</strong> = mover · <strong>grip ↘</strong> = redimensionar (afeta TODOS os
+    selecionados; segure <strong>Shift</strong> pra alinhar) · <strong>Shift+clique</strong> = multi-seleção ·
+    <strong>Ctrl+C / Ctrl+V</strong> = copiar/colar · <strong>Del</strong> = apagar ·
+    <strong>Ctrl+Z</strong> = desfazer · <code>📋 copiar layout</code> = exporta CSS.
   </div>
 
   <script src="design-mode.js"></script>

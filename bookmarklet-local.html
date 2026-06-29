@@ -1,0 +1,148 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>&lt;/&gt; Design Mode — loader local (sempre fresco)</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzBiMGQxMCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTYlIiBmb250LXNpemU9IjEyIiBmb250LWZhbWlseT0ibW9ub3NwYWNlIiBmaWxsPSIjMWRjMDc3IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkb21pbmFudC1iYXNlbGluZT0ibWlkZGxlIj4mbHQ7LyZndDs8L3RleHQ+PC9zdmc+">
+<style>
+  body{font:14px/1.6 ui-monospace,monospace;background:#0b0d10;color:#ddd;max-width:760px;margin:40px auto;padding:0 20px}
+  h1{font-size:18px;color:#fff}
+  a.bm{display:inline-block;padding:10px 16px;background:#13241b;color:#9f7;border:1px solid #1dc077;border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px}
+  code{background:#161a21;padding:2px 6px;border-radius:4px;color:#cfe}
+  .ok{color:#9f7}.warn{color:#e2b04a}.err{color:#f87}
+  ol{padding-left:20px}li{margin:8px 0}
+  hr{border:0;border-top:1px solid #2a2f37;margin:24px 0}
+
+  #status-box{display:flex;align-items:center;gap:12px;background:#161a21;border:1px solid #2a2f37;border-radius:8px;padding:14px 18px;margin:18px 0}
+  #status-dot{width:12px;height:12px;border-radius:50%;background:#555;flex-shrink:0;transition:background .3s}
+  #status-dot.up{background:#1dc077;box-shadow:0 0 6px #1dc077}
+  #status-dot.down{background:#f87;box-shadow:0 0 6px #f87}
+  #status-dot.checking{background:#e2b04a;animation:pulse .8s infinite alternate}
+  @keyframes pulse{to{opacity:.3}}
+  #status-label{flex:1;font-size:13px}
+  .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border:none;border-radius:6px;font:13px/1 ui-monospace,monospace;cursor:pointer;transition:opacity .15s}
+  .btn:hover{opacity:.8}
+  .btn-green{background:#13241b;color:#9f7;border:1px solid #1dc077}
+  .btn-gray{background:#1a1f27;color:#aaa;border:1px solid #2a2f37}
+  .btn-red{background:#1f1316;color:#f9a;border:1px solid #c04050}
+  #actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+  #toast{position:fixed;bottom:20px;right:20px;background:#1dc077;color:#0b0d10;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:bold;opacity:0;transition:opacity .3s;pointer-events:none}
+</style>
+
+<h1>&lt;/&gt; Design Mode — loader local (sempre fresco)</h1>
+
+<p>Este favorito NÃO inlina o código. Ele <b>carrega o <code>design-mode.js</code> do servidor local</b>
+(<code>http://localhost:5601</code>) a cada clique — então você sempre pega a versão mais nova,
+<b class="ok">sem nunca mais re-arrastar</b>.</p>
+
+<!-- STATUS DO SERVIDOR -->
+<div id="status-box">
+  <div id="status-dot" class="checking"></div>
+  <div id="status-label">Verificando servidor em :5601…</div>
+  <div id="actions"></div>
+</div>
+
+<!-- FAVORITO -->
+<p>
+  <a class="bm" href="javascript:(function(){try{if(window.DesignMode&amp;&amp;window.DesignMode.quit)window.DesignMode.quit();}catch(e){}var s=document.createElement('script');s.src='http://localhost:5601/design-mode.js?t='+Date.now();document.body.appendChild(s);})();">&lt;/&gt; Design Mode</a>
+</p>
+
+<ol>
+  <li>Mostre a barra de favoritos: <code>Ctrl+Shift+B</code></li>
+  <li><b>Arraste o botão verde acima</b> pra barra de favoritos — <b>uma única vez</b>.</li>
+  <li>Em qualquer página <code>http://localhost</code>, clique no favorito → barra aparece. Cada clique recarrega a versão fresca.</li>
+</ol>
+
+<hr>
+
+<p>Atalhos: arrastar = mover · canto ↘ = resize · Shift+clique = multi · Ctrl+C/V = copiar/colar · Del = apagar · Ctrl+Z = undo · ✎ design = edição · ▣ estático = trava cliques da página · ✕ = sair</p>
+
+<div id="toast"></div>
+
+<script>
+const DOT    = document.getElementById('status-dot');
+const LABEL  = document.getElementById('status-label');
+const ACTS   = document.getElementById('actions');
+const TOAST  = document.getElementById('toast');
+const URL    = 'http://localhost:5601/design-mode.js';
+const CMD    = 'python -m http.server 5601';
+
+function toast(msg) {
+  TOAST.textContent = msg;
+  TOAST.style.opacity = '1';
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { TOAST.style.opacity = '0'; }, 2000);
+}
+
+function setOnline() {
+  DOT.className = 'up';
+  LABEL.innerHTML = '<span class="ok">Servidor online</span> · <code>http://localhost:5601</code>';
+  ACTS.innerHTML = '';
+
+  var sb = document.createElement('button');
+  sb.className = 'btn btn-red';
+  sb.textContent = '⏹ Desligar servidor';
+  sb.title = 'Copia comando pro PowerShell';
+  sb.onclick = function() {
+    var cmd = 'Stop-Process -Id (Get-NetTCPConnection -LocalPort 5601 -State Listen).OwningProcess -Force';
+    navigator.clipboard.writeText(cmd).then(function() {
+      toast('Copiado! Cole no PowerShell → Enter');
+      var t = setInterval(function() {
+        checkSilent(function(up) {
+          if (!up) { clearInterval(t); setOffline(); }
+        });
+      }, 1500);
+      setTimeout(function(){ clearInterval(t); }, 20000);
+    });
+  };
+  ACTS.appendChild(sb);
+
+  var rb = document.createElement('button');
+  rb.className = 'btn btn-gray'; rb.textContent = '↺ Verificar novamente';
+  rb.onclick = check;
+  ACTS.appendChild(rb);
+}
+
+function setOffline() {
+  DOT.className = 'down';
+  LABEL.innerHTML = '<span class="err">Servidor offline</span> — o favorito não vai funcionar.';
+  ACTS.innerHTML = '';
+
+  var ab = document.createElement('button');
+  ab.className = 'btn btn-green';
+  ab.textContent = '▶ Ligar servidor';
+  ab.title = 'Copia comando pro PowerShell';
+  ab.onclick = function() {
+    var full = 'cd /d "C:\\Users\\User\\Music\\design-mode"; python -m http.server 5601';
+    navigator.clipboard.writeText(full).then(function() {
+      toast('Copiado! Cole no PowerShell → Enter');
+      var t = setInterval(function() {
+        checkSilent(function(up) {
+          if (up) { clearInterval(t); setOnline(); }
+        });
+      }, 1500);
+      setTimeout(function(){ clearInterval(t); }, 20000);
+    });
+  };
+  ACTS.appendChild(ab);
+
+  // Botão verificar novamente
+  var rb = document.createElement('button');
+  rb.className = 'btn btn-gray'; rb.textContent = '↺ Verificar novamente';
+  rb.onclick = check;
+  ACTS.appendChild(rb);
+}
+
+function checkSilent(cb) {
+  fetch(URL + '?check=' + Date.now(), { mode: 'no-cors', cache: 'no-store' })
+    .then(function() { cb(true); })
+    .catch(function() { cb(false); });
+}
+
+function check() {
+  DOT.className = 'checking';
+  LABEL.textContent = 'Verificando…';
+  ACTS.innerHTML = '';
+  checkSilent(function(up) { up ? setOnline() : setOffline(); });
+}
+
+check();
+</script>
